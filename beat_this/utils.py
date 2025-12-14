@@ -102,6 +102,27 @@ def save_beat_tsv(beats: np.ndarray, downbeats: np.ndarray, outpath: str) -> Non
         outpath.unlink()  # avoid half-written files
 
 
+def save_boundary_tsv(boundaries: np.ndarray, outpath: str) -> None:
+    """
+    Save phrase boundary information to a file.
+    Each line has a time in seconds representing a phrase boundary.
+
+    Args:
+        boundaries (numpy.ndarray): Array of phrase boundary positions in seconds.
+        outpath (str): Path to the output TSV file.
+
+    Returns:
+        None
+    """
+    # write the boundary file
+    Path(outpath).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(outpath, "w") as f:
+            f.writelines(f"{boundary}\n" for boundary in boundaries)
+    except KeyboardInterrupt:
+        outpath.unlink()  # avoid half-written files
+
+
 def replace_state_dict_key(state_dict: dict, old: str, new: str):
     """Replaces `old` in all keys of `state_dict` with `new`."""
     keys = list(state_dict.keys())  # take snapshot of the keys
