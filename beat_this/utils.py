@@ -23,11 +23,14 @@ def filename_to_augmentation(filename):
     return augmentations
 
 
+# Legacy beat tracking functions - kept for backward compatibility
+# but not used in phrase boundary detection
 def infer_beat_numbers(beats: np.ndarray, downbeats: np.ndarray) -> np.ndarray:
     """
-    From beat and downbeat times, infer a number for each beat such that each downbeat
+    LEGACY: From beat and downbeat times, infer a number for each beat such that each downbeat
     is associated with a 1 and beats in between are counted upwards.
     The function requires that all downbeats are also listed as beats.
+    This function is not used in phrase boundary detection.
 
     Args:
         beats (numpy.ndarray): Array of beat positions in seconds (including downbeats).
@@ -78,9 +81,10 @@ def infer_beat_numbers(beats: np.ndarray, downbeats: np.ndarray) -> np.ndarray:
 
 def save_beat_tsv(beats: np.ndarray, downbeats: np.ndarray, outpath: str) -> None:
     """
-    Save beat information to a tab-separated file in the standard .beats format:
+    LEGACY: Save beat information to a tab-separated file in the standard .beats format:
     each line has a time in seconds, a tab, and a beat number (1 = downbeat).
     The function requires that all downbeats are also listed as beats.
+    This function is not used in phrase boundary detection.
 
     Args:
         beats (numpy.ndarray): Array of beat positions in seconds (including downbeats).

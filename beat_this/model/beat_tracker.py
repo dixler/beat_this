@@ -16,10 +16,10 @@ from beat_this.utils import replace_state_dict_key
 
 class BeatThis(nn.Module):
     """
-    A neural network model for beat tracking. It is composed of three main components:
+    A neural network model for phrase boundary detection. It is composed of three main components:
     - a frontend that processes the input spectrogram,
     - a series of transformer blocks that process the output of the frontend,
-    - a head that produces the final beat and downbeat predictions.
+    - a head that produces the final phrase boundary predictions.
 
     Args:
         spect_dim (int): The dimension of the input spectrogram (default: 128).
