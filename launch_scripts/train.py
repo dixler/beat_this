@@ -62,7 +62,7 @@ def main(args):
         train_length=args.train_length,
         spect_fps=args.fps,
         num_workers=args.num_workers,
-        test_dataset="gtzan",
+        test_dataset="harmonixset",
         length_based_oversampling_factor=args.length_based_oversampling_factor,
         augmentations=augmentations,
         hung_data=args.hung_data,
@@ -93,7 +93,7 @@ def main(args):
         loss_type=args.loss,
         warmup_steps=args.warmup_steps,
         max_epochs=args.max_epochs,
-        use_dbn=args.dbn,
+        use_dbn=False,  # DBN not applicable for phrase boundaries
         eval_trim_beats=args.eval_trim_beats,
         sum_head=args.sum_head,
         partial_transformers=args.partial_transformers,

@@ -22,11 +22,11 @@ from .mmnpz import MemmappedNpzFile
 
 class BeatTrackingDataset(Dataset):
     """
-    A PyTorch Dataset for beat tracking. This dataset loads preprocessed spectrograms and beat annotations
+    A PyTorch Dataset for phrase boundary detection. This dataset loads preprocessed spectrograms and phrase boundary annotations
     from a given data folder and provides them for training or evaluation.
 
     Args:
-        item_names (list of str): A list of dataset items such as "gtzan/gtzan_rock_00099".
+        item_names (list of str): A list of dataset items such as "harmonixset/track_00001".
         data_folder (Path or str): The base folder where the data is stored.
         spect_fps (int, optional): The frames per second of the spectrograms. Defaults to 50.
         train_length (int, optional): The length of the training sequences in frames. If None the entire piece is used. Defaults to 1500.
@@ -105,41 +105,34 @@ class BeatTrackingDataset(Dataset):
                 )
                 return
 
-        # load beat and produce a default if beat values are not found
+        # load phrase boundaries
         dataset, stem = item_name.split("/", 1)
         annotation_path = (
             self.annotation_basepath
             / dataset
             / "annotations"
-            / "beats"
-            / (stem + ".beats")
+            / "segments"
+            / (stem + ".txt")
         )
-        beat_annotation = np.loadtxt(annotation_path)
-        if beat_annotation.ndim == 2:
-            beat_time = beat_annotation[:, 0]
-            beat_value = beat_annotation[:, 1].astype(int)
+        
+        # Check if phrase boundary annotation exists
+        if not annotation_path.exists():
+            print(f"Skipping {item_name} because phrase boundary annotation is missing.")
+            return
+            
+        boundary_annotation = np.loadtxt(annotation_path)
+        # Phrase boundaries are single column with timestamps
+        if boundary_annotation.ndim == 0:
+            boundary_time = np.array([boundary_annotation])
         else:
-            beat_time = beat_annotation
-            beat_value = np.zeros_like(beat_time, dtype=np.int32)
-
-        # stop if the annotations that are supposed to be there are not there
-        if self.dataset_info[dataset]["has_downbeats"]:
-            if beat_annotation.ndim != 2:
-                print(
-                    f"Skipping {item_name} because it has {beat_annotation.ndim} columns but downbeat is supposed to be there."
-                )
-                return
-
-        # create a downbeat mask to handle the case where the downbeat is not annotated
-        downbeat_mask = self.dataset_info[dataset]["has_downbeats"]
+            boundary_time = boundary_annotation
+        
         # take care of different subsections of rwc for the dataset name
         if dataset == "rwc":
             dataset = "rwc_" + stem.split("_", 2)[1]
         return {
             "spect_path": Path(item_name) / "track.npy",
-            "beat_time": beat_time,
-            "beat_value": beat_value,
-            "downbeat_mask": downbeat_mask,
+            "boundary_time": boundary_time,
             "dataset": dataset,
         }
 
@@ -155,13 +148,9 @@ class BeatTrackingDataset(Dataset):
         """Return number of frames of given item."""
         return len(self._get_spect(self.items[index]))
 
-    def get_beat_count(self, index):
-        """Return number of beats (including downbeats) of given item."""
-        return len(self.items[index]["beat_time"])
-
-    def get_downbeat_count(self, index):
-        """Return number of downbeats of given item."""
-        return (self.items[index]["beat_value"] == 1).sum()
+    def get_boundary_count(self, index):
+        """Return number of phrase boundaries of given item."""
+        return len(self.items[index]["boundary_time"])
 
     def __len__(self):
         return len(self.items)
@@ -206,10 +195,8 @@ class BeatTrackingDataset(Dataset):
 
             # prepare annotations
             (
-                framewise_truth_beat,
-                framewise_truth_downbeat,
-                truth_orig_beat,
-                truth_orig_downbeat,
+                framewise_truth_boundary,
+                truth_orig_boundary,
             ) = prepare_annotations(item, start_frame, end_frame, self.fps)
 
             # restructure the item dict with the correct training information
@@ -218,16 +205,13 @@ class BeatTrackingDataset(Dataset):
                 "spect_path": str(item["spect_path"]),
                 "dataset": item["dataset"],
                 "start_frame": start_frame,
-                "truth_beat": framewise_truth_beat,
-                "truth_downbeat": framewise_truth_downbeat,
-                "downbeat_mask": torch.as_tensor(item["downbeat_mask"]),
+                "truth_boundary": framewise_truth_boundary,
                 "padding_mask": (
                     np.ones(self.train_length, dtype=bool)
                     if self.train_length is not None
                     else np.ones(original_length, dtype=bool)
                 ),
-                "truth_orig_beat": truth_orig_beat,
-                "truth_orig_downbeat": truth_orig_downbeat,
+                "truth_orig_boundary": truth_orig_boundary,
             }
 
             # pad all framewise tensors if needed
@@ -235,8 +219,7 @@ class BeatTrackingDataset(Dataset):
                 item["spect"] = np.pad(
                     item["spect"], [(0, -longer), (0, 0)], constant_values=0
                 )
-                for k in "truth_beat", "truth_downbeat":
-                    item[k] = np.pad(item[k], [(0, -longer)], constant_values=0)
+                item["truth_boundary"] = np.pad(item["truth_boundary"], [(0, -longer)], constant_values=0)
                 item["padding_mask"][longer:] = 0
             return item
 
@@ -246,18 +229,18 @@ class BeatTrackingDataset(Dataset):
 
 class BeatDataModule(pl.LightningDataModule):
     """
-    A PyTorch Lightning DataModule for beat tracking. This DataModule handles the loading and preprocessing of the
+    A PyTorch Lightning DataModule for phrase boundary detection. This DataModule handles the loading and preprocessing of the
     BeatTrackingDataset and prepares it for use with a PyTorch Lightning model.
-    It can produce cross-validation or single  train/val/test splits.
+    It can produce cross-validation or single train/val/test splits.
 
     Args:
-        data_dir (Path or str): The parent directory where the data (spectrograms and beat labels) is stored.
+        data_dir (Path or str): The parent directory where the data (spectrograms and phrase boundary labels) is stored.
         batch_size (int, optional): The size of the batches to be generated by the DataLoader. Defaults to 8.
-        train_length (int, optional): The length of the subsequences in frames. If None, the entire pieces are returner. Defaults to 1500.
+        train_length (int, optional): The length of the subsequences in frames. If None, the entire pieces are returned. Defaults to 1500.
         num_workers (int, optional): The number of worker processes to use for data loading. Defaults to 20.
         augmentations (dict, optional): A dictionary of data augmentations to apply. Defaults to {"pitch": {"min": -5, "max": 6}, "time": {"min": -20, "max": 20, "stride": 4}}.
-        test_dataset (str, optional): The name of the dataset to use for testing. Defaults to "gtzan".
-        hung_data (bool, optional): If True, only use the datasets from the Hung et al. paper for training; validation is still on all datasets. Defaults to False.
+        test_dataset (str, optional): The name of the dataset to use for testing. Defaults to "harmonixset".
+        hung_data (bool, optional): Not applicable for phrase boundaries. Defaults to False.
         no_val (bool, optional): If True, train on all train+val data and do not use a validation set; for compatibility reason, the validation metrics are still computed, but are not meaningful. Defaults to False.
         spect_fps (int, optional): The frames per second of the spectrograms. Defaults to 50.
         length_based_oversampling_factor (int, optional): The factor by which to oversample the train dataset based on sequence length. Defaults to 0.
@@ -275,7 +258,7 @@ class BeatDataModule(pl.LightningDataModule):
             "pitch": {"min": -5, "max": 6},
             "tempo": {"min": -20, "max": 20, "stride": 4},
         },
-        test_dataset="gtzan",
+        test_dataset="harmonixset",
         hung_data=False,
         no_val=False,
         spect_fps=50,
@@ -478,79 +461,47 @@ class BeatDataModule(pl.LightningDataModule):
         frames around each positive label).
         For example a `widen_target_mask` of 3 will ignore 7 frames, 3 for each side plus the central.
         """
-        # find the positive weight for the loss as a ratio between (down)beat and non-(down)beat annotation
+        # find the positive weight for the loss as a ratio between boundary and non-boundary annotation
         dataset = self.train_dataset
-        all_frames = all_frames_db = 0
+        all_frames = 0
         for item in dataset.items:
             frames = len(dataset._get_spect(item))
             all_frames += frames
-            if item["downbeat_mask"]:
-                all_frames_db += frames
-        beat_frames = sum(len(item["beat_value"]) for item in dataset.items)
-        downbeat_frames = sum(
-            (item["beat_value"] == 1).sum()
-            for item in dataset.items
-            if item["downbeat_mask"]
-        )
+        boundary_frames = sum(len(item["boundary_time"]) for item in dataset.items)
 
         return {
-            "beat": int(
+            "boundary": int(
                 np.round(
-                    (all_frames - beat_frames * (widen_target_mask * 2 + 1))
-                    / beat_frames
-                )
-            ),
-            "downbeat": int(
-                np.round(
-                    (all_frames_db - downbeat_frames * (widen_target_mask * 2 + 1))
-                    / downbeat_frames
+                    (all_frames - boundary_frames * (widen_target_mask * 2 + 1))
+                    / boundary_frames
                 )
             ),
         }
 
 
 def prepare_annotations(item, start_frame, end_frame, fps):
-    truth_bdb_time = item["beat_time"]
-    truth_bdb_value = item["beat_value"]
-    # convert beat time from seconds to frame
-    truth_bdb_frame = (truth_bdb_time * fps).round().astype(int)
+    truth_boundary_time = item["boundary_time"]
+    # convert boundary time from seconds to frame
+    truth_boundary_frame = (truth_boundary_time * fps).round().astype(int)
     # form annotations excerpt
     # filter out the annotations that are earlier than the start and shift left
-    truth_bdb_frame -= start_frame
-    idx = np.searchsorted(truth_bdb_frame, 0)
-    truth_bdb_frame = truth_bdb_frame[idx:]
-    truth_bdb_value = truth_bdb_value[idx:]
+    truth_boundary_frame -= start_frame
+    idx = np.searchsorted(truth_boundary_frame, 0)
+    truth_boundary_frame = truth_boundary_frame[idx:]
     # filter out the annotations that are later than the end
-    idx = np.searchsorted(truth_bdb_frame, end_frame - start_frame)
-    truth_bdb_frame = truth_bdb_frame[:idx]
-    truth_bdb_value = truth_bdb_value[:idx]
-    # create beat and downbeat separated annotations
-    truth_beat = truth_bdb_frame
-    truth_downbeat = truth_bdb_frame[truth_bdb_value == 1]
-    # transform beat downbeat to frame-wise annotations
-    framewise_truth_beat = index_to_framewise(truth_beat, end_frame - start_frame)
-    framewise_truth_downbeat = index_to_framewise(
-        truth_downbeat, end_frame - start_frame
-    )
-    # create orig beat, downbeat annotations for unquantized evaluation
-    truth_orig_beat = item["beat_time"]
-    truth_orig_downbeat = truth_bdb_time[
-        item["beat_value"] == 1
-    ]  # (use the full beat_value)
+    idx = np.searchsorted(truth_boundary_frame, end_frame - start_frame)
+    truth_boundary_frame = truth_boundary_frame[:idx]
+    # transform boundary to frame-wise annotations
+    framewise_truth_boundary = index_to_framewise(truth_boundary_frame, end_frame - start_frame)
+    # create orig boundary annotations for unquantized evaluation
+    truth_orig_boundary = item["boundary_time"]
     # filter out the annotations that are outside the excerpt, and shift them left to the excerpt time
-    truth_orig_beat = truth_orig_beat[
-        (truth_orig_beat >= start_frame / fps) & (truth_orig_beat < end_frame / fps)
-    ] - (start_frame / fps)
-    truth_orig_downbeat = truth_orig_downbeat[
-        (truth_orig_downbeat >= start_frame / fps)
-        & (truth_orig_downbeat < end_frame / fps)
+    truth_orig_boundary = truth_orig_boundary[
+        (truth_orig_boundary >= start_frame / fps) & (truth_orig_boundary < end_frame / fps)
     ] - (start_frame / fps)
     # convert to strings (trick to collate sequences of different lengths)
-    truth_orig_beat = truth_orig_beat.tobytes()
-    truth_orig_downbeat = truth_orig_downbeat.tobytes()
+    truth_orig_boundary = truth_orig_boundary.tobytes()
     return (
-        framewise_truth_beat,
-        framewise_truth_downbeat,
-        truth_orig_beat,
-        truth_orig_downbeat,
+        framewise_truth_boundary,
+        truth_orig_boundary,
     )
