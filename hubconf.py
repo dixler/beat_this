@@ -12,7 +12,11 @@ from beat_this.inference import (
     BeatThis,
     Spect2Frames,
     Audio2Frames,
-    Audio2Beats,
-    File2Beats,
+    Audio2Boundaries,
+    File2Boundaries,
     File2File,
 )
+
+# Backward compatibility aliases
+Audio2Beats = Audio2Boundaries
+File2Beats = File2Boundaries

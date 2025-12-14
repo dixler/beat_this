@@ -1,6 +1,8 @@
 # Beat This!
 Official implementation of the beat tracker from the ISMIR 2024 paper "[Beat This! Accurate Beat Tracking Without DBN Postprocessing](https://arxiv.org/abs/2407.21658)" by Francesco Foscarin, Jan Schlüter and Gerhard Widmer.
 
+**NOTE**: This fork has been modified to predict phrase change boundaries instead of beats and downbeats. The model architecture remains the same, but the output is a single prediction for phrase boundaries. Use the harmonixset dataset for training and evaluation.
+
 * [Inference](#inference)
 * [Available models](#available-models)
 * [Data](#data)
