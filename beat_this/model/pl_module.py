@@ -34,6 +34,7 @@ class PLBeatThis(LightningModule):
         warmup_steps=1000,
         max_epochs=100,
         use_dbn=False,
+        eval_trim_beats=None,
         eval_tolerance=0.5,
         sum_head=True,
         partial_transformers=True,
