@@ -6,7 +6,7 @@ from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
-from beat_this.dataset import BeatDataModule
+from beat_this.dataset import PhraseDataModule
 from beat_this.model.pl_module import PLBeatThis
 
 
@@ -56,13 +56,12 @@ def main(args):
             "max_parts": 9,
         }
 
-    datamodule = BeatDataModule(
+    datamodule = PhraseDataModule(
         data_dir,
         batch_size=args.batch_size,
         train_length=args.train_length,
         spect_fps=args.fps,
         num_workers=args.num_workers,
-        test_dataset="gtzan",
         length_based_oversampling_factor=args.length_based_oversampling_factor,
         augmentations=augmentations,
         hung_data=args.hung_data,

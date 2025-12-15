@@ -301,38 +301,26 @@ class PartialFTTransformer(nn.Module):
 
 
 class SumHead(nn.Module):
-    """
-    A PyTorch module that produces the final beat and downbeat prediction logits.
-    The beats are a sum of all beats and all downbeats predictions, to reduce the prediction
-    of downbeats which are not beats.
-    """
+    """Projection head producing boundary logits."""
 
     def __init__(self, input_dim):
         super().__init__()
-        self.beat_downbeat_lin = nn.Linear(input_dim, 2)
+        self.boundary_lin = nn.Linear(input_dim, 1)
 
     def forward(self, x):
-        beat_downbeat = self.beat_downbeat_lin(x)
-        # separate beat from downbeat
-        beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
-        # aggregate beats and downbeats prediction
-        # autocast to float16 disabled to avoid numerical issues causing NaNs
-        with torch.autocast(beat.device.type, enabled=False):
-            beat = beat.float() + downbeat.float()
-        return {"beat": beat, "downbeat": downbeat}
+        boundary = self.boundary_lin(x)
+        boundary = rearrange(boundary, "b t c -> b t")
+        return {"boundary": boundary}
 
 
 class Head(nn.Module):
-    """
-    A PyToch module that produces the final beat and downbeat prediction logits with independent linear layers outputs.
-    """
+    """Independent linear head for boundary logits."""
 
     def __init__(self, input_dim):
         super().__init__()
-        self.beat_downbeat_lin = nn.Linear(input_dim, 2)
+        self.boundary_lin = nn.Linear(input_dim, 1)
 
     def forward(self, x):
-        beat_downbeat = self.beat_downbeat_lin(x)
-        # separate beat from downbeat
-        beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
-        return {"beat": beat, "downbeat": downbeat}
+        boundary = self.boundary_lin(x)
+        boundary = rearrange(boundary, "b t c -> b t")
+        return {"boundary": boundary}
