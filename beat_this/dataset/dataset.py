@@ -87,7 +87,21 @@ class PhraseBoundaryDataset(Dataset):
         }
 
     def _get_spect(self, item):
-        return np.load(item["spect_path"], mmap_mode="r")
+        spect = np.load(item["spect_path"], mmap_mode="r")
+        spect = np.asarray(spect)
+        if spect.ndim != 2:
+            raise ValueError(
+                f"Expected 2D spectrogram, got shape {spect.shape} for {item['spect_path']}"
+            )
+
+        if spect.shape[1] == self.spect_dim:
+            return spect
+        if spect.shape[0] == self.spect_dim:
+            return spect.T
+
+        raise ValueError(
+            f"Could not infer time/mel axes for {item['spect_path']} with shape {spect.shape}"
+        )
 
     def get_frame_count(self, index):
         """Return number of frames of given item."""
