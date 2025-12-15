@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytorch_lightning as pl
+import torch
 from torch.utils.data import DataLoader, Dataset
 
 from beat_this.dataset.augment import augment_mask_, augment_pitchtempo
@@ -417,9 +418,9 @@ def collate_phrase_batches(batch):
     max_len = max(item["spect"].shape[0] for item in batch)
     max_mel = max(item["spect"].shape[1] for item in batch)
 
-    spect = np.zeros((len(batch), max_len, max_mel), dtype=np.float32)
-    truth_boundary = np.zeros((len(batch), max_len), dtype=np.float32)
-    padding_mask = np.zeros((len(batch), max_len), dtype=bool)
+    spect = torch.zeros((len(batch), max_len, max_mel), dtype=torch.float32)
+    truth_boundary = torch.zeros((len(batch), max_len), dtype=torch.float32)
+    padding_mask = torch.zeros((len(batch), max_len), dtype=torch.bool)
 
     collated = {
         "spect": spect,
@@ -434,14 +435,14 @@ def collate_phrase_batches(batch):
     for idx, item in enumerate(batch):
         length = item["spect"].shape[0]
         mel_dim = item["spect"].shape[1]
-        collated["spect"][idx, :length, :mel_dim] = np.asarray(
-            item["spect"], dtype=np.float32
+        collated["spect"][idx, :length, :mel_dim] = torch.as_tensor(
+            item["spect"], dtype=torch.float32
         )
-        collated["truth_boundary"][idx, :length] = np.asarray(
-            item["truth_boundary"], dtype=np.float32
+        collated["truth_boundary"][idx, :length] = torch.as_tensor(
+            item["truth_boundary"], dtype=torch.float32
         )
-        collated["padding_mask"][idx, :length] = np.asarray(
-            item["padding_mask"], dtype=bool
+        collated["padding_mask"][idx, :length] = torch.as_tensor(
+            item["padding_mask"], dtype=torch.bool
         )
         collated["dataset"].append(item["dataset"])
         collated["spect_path"].append(item["spect_path"])
