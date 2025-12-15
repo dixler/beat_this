@@ -194,11 +194,17 @@ class PhraseDataModule(pl.LightningDataModule):
         fold=None,
         predict_datasplit="test",
         mel_suffix="-mel.npy",
+        segment_dir=None,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.initialized = {}
         self.data_dir = Path(data_dir)
+        self.segment_dir = (
+            Path(segment_dir)
+            if segment_dir is not None
+            else self.data_dir / "harmonixset" / "dataset" / "segments"
+        )
         self.batch_size = batch_size
         self.train_length = train_length
         self.num_workers = num_workers
@@ -246,6 +252,7 @@ class PhraseDataModule(pl.LightningDataModule):
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                segment_dir=self.segment_dir,
                 mel_suffix=self.mel_suffix,
             )
             print("Validation set:", len(self.val_dataset), "items")
@@ -260,6 +267,7 @@ class PhraseDataModule(pl.LightningDataModule):
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
                 length_based_oversampling_factor=self.length_based_oversampling_factor,
+                segment_dir=self.segment_dir,
                 mel_suffix=self.mel_suffix,
             )
             print("Training set:", len(self.train_dataset), "items")
@@ -273,6 +281,7 @@ class PhraseDataModule(pl.LightningDataModule):
                 train_length=None,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                segment_dir=self.segment_dir,
                 mel_suffix=self.mel_suffix,
             )
             print("Test set:", len(self.test_dataset), "items")
@@ -296,21 +305,30 @@ class PhraseDataModule(pl.LightningDataModule):
                     train_length=None,
                     data_folder=self.data_dir,
                     spect_fps=self.spect_fps,
+                    segment_dir=self.segment_dir,
                     mel_suffix=self.mel_suffix,
                 )
             self.initialized["predict"] = True
 
     def _available_stems(self):
+        if not self.segment_dir.exists():
+            raise FileNotFoundError(
+                f"Segment annotations not found at {self.segment_dir}. "
+                "Pass an explicit segment_dir if your layout differs."
+            )
+
         stems = []
         for mel in sorted(self.data_dir.glob(f"*{self.mel_suffix}")):
             stem = mel.stem
             if self.mel_suffix_no_ext:
                 stem = stem.removesuffix(self.mel_suffix_no_ext)
-            annotation_path = self.data_dir / "harmonixset" / "dataset" / "segments" / f"{stem}.txt"
+            annotation_path = self.segment_dir / f"{stem}.txt"
             if annotation_path.exists():
                 stems.append(stem)
             else:
-                print(f"Skipping {stem} because segment annotation is missing at {annotation_path}.")
+                print(
+                    f"Skipping {stem} because segment annotation is missing at {annotation_path}."
+                )
         return stems
 
     def train_dataloader(self):

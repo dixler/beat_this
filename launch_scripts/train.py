@@ -67,6 +67,7 @@ def main(args):
         hung_data=args.hung_data,
         no_val=not args.val,
         fold=args.fold,
+        segment_dir=args.segment_dir,
     )
     datamodule.setup(stage="fit")
 
@@ -165,6 +166,12 @@ if __name__ == "__main__":
     parser.add_argument("--logger", type=str, choices=["wandb", "none"], default="none")
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--data-dir", type=Path, default=Path.home() / "Data" / "harmonix")
+    parser.add_argument(
+        "--segment-dir",
+        type=Path,
+        default=None,
+        help="Path to Harmonix segment annotations (defaults to <data-dir>/harmonixset/dataset/segments).",
+    )
     parser.add_argument("--n-heads", type=int, default=16)
     parser.add_argument(
         "--fps", type=float, default=None, help="Override spectrogram fps; defaults to info.json."
