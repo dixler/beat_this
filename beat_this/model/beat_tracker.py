@@ -309,7 +309,7 @@ class SumHead(nn.Module):
 
     def forward(self, x):
         boundary = self.boundary_lin(x)
-        boundary = rearrange(boundary, "b t c -> b t")
+        boundary = rearrange(boundary, "b t 1 -> b t")
         return {"boundary": boundary}
 
 
@@ -322,5 +322,5 @@ class Head(nn.Module):
 
     def forward(self, x):
         boundary = self.boundary_lin(x)
-        boundary = rearrange(boundary, "b t c -> b t")
+        boundary = rearrange(boundary, "b t 1 -> b t")
         return {"boundary": boundary}
