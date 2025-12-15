@@ -84,12 +84,30 @@ class PhraseBoundaryDataset(Dataset):
 
         return {
             "spect_path": spect_path,
+            "base_spect_path": spect_path,
             "boundary_time": boundary_times,
             "dataset": "harmonix",
         }
 
-    def _get_spect(self, item):
-        spect = np.load(item["spect_path"], mmap_mode="r")
+    def _resolve_spect_path(self, item):
+        spect_path = Path(item["spect_path"])
+        if spect_path.exists():
+            return spect_path
+
+        base_path = Path(item.get("base_spect_path", spect_path))
+        if base_path.exists():
+            print(
+                f"Falling back to base spectrogram for {spect_path.name} at {base_path}."
+            )
+            return base_path
+
+        raise FileNotFoundError(
+            f"Missing spectrogram for {spect_path}. Checked base path {base_path} as well."
+        )
+
+    def _get_spect(self, item, spect_path=None):
+        spect_path = self._resolve_spect_path(item) if spect_path is None else spect_path
+        spect = np.load(spect_path, mmap_mode="r")
         spect = np.asarray(spect)
         if spect.ndim != 2:
             raise ValueError(
@@ -124,7 +142,8 @@ class PhraseBoundaryDataset(Dataset):
             item = augment_pitchtempo(item, self.augmentations)
 
             # load spectrogram
-            spect = self._get_spect(item)
+            spect_path = self._resolve_spect_path(item)
+            spect = self._get_spect(item, spect_path)
 
             # define the excerpt to use
             original_length = len(spect)
@@ -163,7 +182,7 @@ class PhraseBoundaryDataset(Dataset):
             # restructure the item dict with the correct training information
             item = {
                 "spect": spect,
-                "spect_path": str(item["spect_path"]),
+                "spect_path": str(spect_path),
                 "dataset": item["dataset"],
                 "start_frame": start_frame,
                 "truth_boundary": framewise_truth_boundary,
