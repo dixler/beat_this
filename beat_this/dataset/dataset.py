@@ -339,21 +339,33 @@ class PhraseDataModule(pl.LightningDataModule):
             shuffle=True,
             drop_last=True,
             pin_memory=True,
+            collate_fn=collate_phrase_batches,
         )
 
     def val_dataloader(self):
         # Warning: for performances, this only runs on the middle excerpt of the long pieces
         # The paper results are computed after training in the predict script
         return DataLoader(
-            self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            collate_fn=collate_phrase_batches,
         )
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=1, num_workers=self.num_workers)
+        return DataLoader(
+            self.test_dataset,
+            batch_size=1,
+            num_workers=self.num_workers,
+            collate_fn=collate_phrase_batches,
+        )
 
     def predict_dataloader(self):
         return DataLoader(
-            self.predict_dataset, batch_size=1, num_workers=self.num_workers
+            self.predict_dataset,
+            batch_size=1,
+            num_workers=self.num_workers,
+            collate_fn=collate_phrase_batches,
         )
 
     def get_train_positive_weights(self, widen_target_mask=3):
@@ -397,3 +409,40 @@ def prepare_annotations(item, start_frame, end_frame, fps):
     ] - (start_frame / fps)
     truth_orig_boundary = truth_orig_boundary.tobytes()
     return framewise_truth_boundary, truth_orig_boundary
+
+
+def collate_phrase_batches(batch):
+    """Pad variable-length phrase excerpts so PyTorch can stack them."""
+
+    max_len = max(item["spect"].shape[0] for item in batch)
+    mel_dim = batch[0]["spect"].shape[1]
+
+    spect = np.zeros((len(batch), max_len, mel_dim), dtype=np.float32)
+    truth_boundary = np.zeros((len(batch), max_len), dtype=np.float32)
+    padding_mask = np.zeros((len(batch), max_len), dtype=bool)
+
+    collated = {
+        "spect": spect,
+        "truth_boundary": truth_boundary,
+        "padding_mask": padding_mask,
+        "dataset": [],
+        "spect_path": [],
+        "start_frame": [],
+        "truth_orig_boundary": [],
+    }
+
+    for idx, item in enumerate(batch):
+        length = item["spect"].shape[0]
+        collated["spect"][idx, :length] = np.asarray(item["spect"], dtype=np.float32)
+        collated["truth_boundary"][idx, :length] = np.asarray(
+            item["truth_boundary"], dtype=np.float32
+        )
+        collated["padding_mask"][idx, :length] = np.asarray(
+            item["padding_mask"], dtype=bool
+        )
+        collated["dataset"].append(item["dataset"])
+        collated["spect_path"].append(item["spect_path"])
+        collated["start_frame"].append(item["start_frame"])
+        collated["truth_orig_boundary"].append(item["truth_orig_boundary"])
+
+    return collated
