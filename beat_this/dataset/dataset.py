@@ -415,9 +415,9 @@ def collate_phrase_batches(batch):
     """Pad variable-length phrase excerpts so PyTorch can stack them."""
 
     max_len = max(item["spect"].shape[0] for item in batch)
-    mel_dim = batch[0]["spect"].shape[1]
+    max_mel = max(item["spect"].shape[1] for item in batch)
 
-    spect = np.zeros((len(batch), max_len, mel_dim), dtype=np.float32)
+    spect = np.zeros((len(batch), max_len, max_mel), dtype=np.float32)
     truth_boundary = np.zeros((len(batch), max_len), dtype=np.float32)
     padding_mask = np.zeros((len(batch), max_len), dtype=bool)
 
@@ -433,7 +433,10 @@ def collate_phrase_batches(batch):
 
     for idx, item in enumerate(batch):
         length = item["spect"].shape[0]
-        collated["spect"][idx, :length] = np.asarray(item["spect"], dtype=np.float32)
+        mel_dim = item["spect"].shape[1]
+        collated["spect"][idx, :length, :mel_dim] = np.asarray(
+            item["spect"], dtype=np.float32
+        )
         collated["truth_boundary"][idx, :length] = np.asarray(
             item["truth_boundary"], dtype=np.float32
         )
