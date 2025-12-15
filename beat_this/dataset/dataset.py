@@ -22,6 +22,7 @@ class PhraseBoundaryDataset(Dataset):
         item_names: list[str],
         data_folder,
         spect_fps,
+        spect_dim,
         train_length=None,
         deterministic=False,
         augmentations={},
@@ -42,6 +43,7 @@ class PhraseBoundaryDataset(Dataset):
         self.deterministic = deterministic
         self.augmentations = augmentations
         self.length_based_oversampling_factor = length_based_oversampling_factor
+        self.spect_dim = spect_dim
         # load the annotations in parallel
         with concurrent.futures.ThreadPoolExecutor() as executor:
             items = executor.map(self._load_dataset_item, item_names)
@@ -267,6 +269,7 @@ class PhraseDataModule(pl.LightningDataModule):
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                spect_dim=self.spect_dim,
                 segment_dir=self.segment_dir,
                 mel_suffix=self.mel_suffix,
             )
@@ -281,6 +284,7 @@ class PhraseDataModule(pl.LightningDataModule):
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                spect_dim=self.spect_dim,
                 length_based_oversampling_factor=self.length_based_oversampling_factor,
                 segment_dir=self.segment_dir,
                 mel_suffix=self.mel_suffix,
@@ -296,6 +300,7 @@ class PhraseDataModule(pl.LightningDataModule):
                 train_length=None,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                spect_dim=self.spect_dim,
                 segment_dir=self.segment_dir,
                 mel_suffix=self.mel_suffix,
             )
@@ -320,6 +325,7 @@ class PhraseDataModule(pl.LightningDataModule):
                     train_length=None,
                     data_folder=self.data_dir,
                     spect_fps=self.spect_fps,
+                    spect_dim=self.spect_dim,
                     segment_dir=self.segment_dir,
                     mel_suffix=self.mel_suffix,
                 )
