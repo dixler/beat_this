@@ -1,10 +1,15 @@
 import argparse
 from pathlib import Path
 
+import sys
 import torch
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from beat_this.dataset import PhraseDataModule
 from beat_this.model.pl_module import PLBeatThis

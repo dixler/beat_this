@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 from pytorch_lightning import Trainer, seed_everything
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from beat_this.dataset import PhraseDataModule
 from beat_this.inference import load_checkpoint
