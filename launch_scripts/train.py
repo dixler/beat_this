@@ -35,7 +35,7 @@ def main(args):
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(False)
 
-    data_dir = Path(__file__).parent.parent.relative_to(Path.cwd()) / "data"
+    data_dir = Path(args.data_dir)
     checkpoint_dir = (
         Path(__file__).parent.parent.relative_to(Path.cwd()) / "checkpoints"
     )
@@ -78,8 +78,8 @@ def main(args):
         "transformer": args.transformer_dropout,
     }
     pl_model = PLBeatThis(
-        spect_dim=128,
-        fps=50,
+        spect_dim=datamodule.spect_dim,
+        fps=datamodule.spect_fps,
         transformer_dim=args.transformer_dim,
         ff_mult=4,
         n_layers=args.n_layers,
@@ -164,8 +164,11 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--logger", type=str, choices=["wandb", "none"], default="none")
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--data-dir", type=Path, default=Path.home() / "Data" / "harmonix")
     parser.add_argument("--n-heads", type=int, default=16)
-    parser.add_argument("--fps", type=int, default=50, help="The spectrograms fps.")
+    parser.add_argument(
+        "--fps", type=float, default=None, help="Override spectrogram fps; defaults to info.json."
+    )
     parser.add_argument(
         "--loss",
         type=str,

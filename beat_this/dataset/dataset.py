@@ -1,23 +1,14 @@
 import concurrent.futures
 import itertools
 import json
-import re
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytorch_lightning as pl
-import torch
 from torch.utils.data import DataLoader, Dataset
 
-from beat_this.dataset.augment import (
-    augment_mask_,
-    augment_pitchtempo,
-    precomputed_augmentation_filenames,
-)
+from beat_this.dataset.augment import augment_mask_, augment_pitchtempo
 from beat_this.utils import index_to_framewise
-
-from .mmnpz import MemmappedNpzFile
 
 
 class PhraseBoundaryDataset(Dataset):
@@ -29,30 +20,32 @@ class PhraseBoundaryDataset(Dataset):
         self,
         item_names: list[str],
         data_folder,
-        spect_fps=50,
+        spect_fps,
         train_length=None,
         deterministic=False,
         augmentations={},
         length_based_oversampling_factor=0,
+        mel_suffix="-mel.npy",
+        segment_dir=None,
     ):
-        self.spect_basepath = data_folder / "audio" / "spectrograms"
-        self.annotation_basepath = data_folder / "annotations"
+        self.data_folder = Path(data_folder)
+        self.spect_basepath = self.data_folder
+        self.segment_dir = (
+            Path(segment_dir)
+            if segment_dir is not None
+            else self.data_folder / "harmonixset" / "dataset" / "segments"
+        )
+        self.mel_suffix = mel_suffix
         self.fps = spect_fps
         self.train_length = train_length
         self.deterministic = deterministic
         self.augmentations = augmentations
         self.length_based_oversampling_factor = length_based_oversampling_factor
-        datasets = sorted(set(name.split("/", 1)[0] for name in item_names))
-        # load dataset info
-        self.dataset_info = self._load_dataset_infos(datasets)
-        # load .npz spectrogram bundles, if any
-        self.spects = self._load_spect_bundles(datasets)
         # load the annotations in parallel
         with concurrent.futures.ThreadPoolExecutor() as executor:
             items = executor.map(self._load_dataset_item, item_names)
         items = [item for item in items if item is not None]
         if self.length_based_oversampling_factor and self.train_length is not None:
-            # oversample the dataset according to the audio lengths, so that long pieces are sampled more often
             oversampled_items = []
             for item in items:
                 oversampling_factor = np.round(
@@ -68,60 +61,32 @@ class PhraseBoundaryDataset(Dataset):
             items = oversampled_items
         self.items = items
 
-    def _load_dataset_infos(self, datasets):
-        dataset_info = {}
-        for dataset in datasets:
-            with open(self.annotation_basepath / dataset / "info.json") as f:
-                dataset_info[dataset] = json.load(f)
-        return dataset_info
-
-    def _load_spect_bundles(self, datasets):
-        spects = {}
-        for dataset in datasets:
-            npz_file = (self.spect_basepath / dataset).with_suffix(".npz")
-            if npz_file.exists():
-                spects[dataset] = MemmappedNpzFile(npz_file)
-        return spects
-
-    def _load_dataset_item(self, item_name):
-        # stop if not all the augmented audio files are there
-        dataset, remainder = item_name.split("/", 1)
-        for aug_filename in precomputed_augmentation_filenames(self.augmentations):
-            if (f"{remainder}/{aug_filename[:-4]}") not in self.spects.get(
-                dataset, ()
-            ) and not (self.spect_basepath / item_name / aug_filename).exists():
-                print(
-                    f"Skipping {item_name} because not all necessary spectrograms are there."
-                )
-                return
-
-        # load phrase boundary annotations
-        dataset, stem = item_name.split("/", 1)
-        annotation_path = (
-            self.annotation_basepath
-            / dataset
-            / "annotations"
-            / "phrase_changes"
-            / (stem + ".txt")
-        )
-        if not annotation_path.exists():
-            print(f"Skipping {item_name} because phrase annotations are missing.")
+    def _load_dataset_item(self, stem: str):
+        spect_path = self.spect_basepath / f"{stem}{self.mel_suffix}"
+        if not spect_path.exists():
+            print(f"Skipping {stem} because mel spectrogram is missing at {spect_path}.")
             return
 
-        boundary_times = np.loadtxt(annotation_path, ndmin=1)
+        annotation_path = self.segment_dir / f"{stem}.txt"
+        if not annotation_path.exists():
+            print(f"Skipping {stem} because segment annotation is missing at {annotation_path}.")
+            return
+
+        try:
+            boundary_times = np.loadtxt(annotation_path, ndmin=1, usecols=[0])
+        except Exception:
+            print(f"Skipping {stem} because annotations could not be read from {annotation_path}.")
+            return
+        boundary_times = boundary_times[1:] if boundary_times.size else boundary_times
+
         return {
-            "spect_path": Path(item_name) / "track.npy",
+            "spect_path": spect_path,
             "boundary_time": boundary_times,
-            "dataset": dataset,
+            "dataset": "harmonix",
         }
 
     def _get_spect(self, item):
-        try:
-            dataset, filename = str(item["spect_path"]).split("/", 1)
-            spect = self.spects[dataset][filename[:-4]]
-        except KeyError:
-            spect = np.load(self.spect_basepath / item["spect_path"], mmap_mode="r")
-        return spect
+        return np.load(item["spect_path"], mmap_mode="r")
 
     def get_frame_count(self, index):
         """Return number of frames of given item."""
@@ -209,27 +174,11 @@ class PhraseBoundaryDataset(Dataset):
 
 
 class PhraseDataModule(pl.LightningDataModule):
-    """
-    Lightning DataModule for phrase-boundary detection on HarmonixSet using full-track excerpts.
-
-    Args:
-        data_dir (Path or str): The parent directory where the data (spectrograms and labels) is stored.
-        batch_size (int, optional): The size of the batches to be generated by the DataLoader. Defaults to 8.
-        train_length (int, optional): The length of the subsequences in frames. If None, the entire pieces are returned. Defaults to None.
-        num_workers (int, optional): The number of worker processes to use for data loading. Defaults to 20.
-        augmentations (dict, optional): A dictionary of data augmentations to apply. Defaults to {"pitch": {"min": -5, "max": 6}, "tempo": {"min": -20, "max": 20, "stride": 4}}.
-        test_dataset (str, optional): The name of the dataset to use for testing. Defaults to "harmonix".
-        hung_data (bool, optional): If True, only use HarmonixSet entries. Defaults to False.
-        no_val (bool, optional): If True, train on all train+val data and do not use a validation set. Defaults to False.
-        spect_fps (int, optional): The frames per second of the spectrograms. Defaults to 50.
-        length_based_oversampling_factor (int, optional): The factor by which to oversample the train dataset based on sequence length. Defaults to 0.
-        fold (int, optional): The fold number for cross-validation. If None, the single split is used. Defaults to None.
-        predict_datasplit (str, optional): The split to use for prediction. Prediction dataset is always full pieces. Defaults to "test".
-    """
+    """Lightning DataModule wired for the local Harmonix mel/segment layout."""
 
     def __init__(
         self,
-        data_dir,
+        data_dir=Path.home() / "Data" / "harmonix",
         batch_size=8,
         train_length=None,
         num_workers=20,
@@ -240,15 +189,15 @@ class PhraseDataModule(pl.LightningDataModule):
         test_dataset="harmonix",
         hung_data=False,
         no_val=False,
-        spect_fps=50,
+        spect_fps=None,
         length_based_oversampling_factor=0,
         fold=None,
         predict_datasplit="test",
+        mel_suffix="-mel.npy",
     ):
         super().__init__()
         self.save_hyperparameters()
         self.initialized = {}
-        # remember all arguments
         self.data_dir = Path(data_dir)
         self.batch_size = batch_size
         self.train_length = train_length
@@ -259,67 +208,36 @@ class PhraseDataModule(pl.LightningDataModule):
         self.test_set_name = test_dataset
         self.hung_data = hung_data
         self.no_val = no_val
-        self.spect_fps = spect_fps
         self.length_based_oversampling_factor = length_based_oversampling_factor
         self.fold = fold
         self.predict_datasplit = predict_datasplit
+        self.mel_suffix = mel_suffix
+        suffix_ext = Path(mel_suffix).suffix
+        self.mel_suffix_no_ext = (
+            mel_suffix[: -len(suffix_ext)] if suffix_ext else mel_suffix
+        )
+
+        info_path = self.data_dir / "info.json"
+        self.dataset_info = json.loads(info_path.read_text()) if info_path.exists() else {}
+        derived_fps = None
+        if "SR" in self.dataset_info and "HOP_LENGTH" in self.dataset_info:
+            derived_fps = self.dataset_info["SR"] / self.dataset_info["HOP_LENGTH"]
+        self.spect_fps = spect_fps if spect_fps is not None else derived_fps or 50
+        self.spect_dim = self.dataset_info.get("N_MELS", 128)
 
     def setup(self, stage):
         if self.initialized.get(stage, False):
             return
+        stems = self._available_stems()
 
-        # set up the paths
-        annotation_dir = self.data_dir / "annotations"
+        test_cut = max(1, int(len(stems) * 0.1)) if len(stems) > 1 else 0
+        val_cut = 0 if self.no_val else (max(1, int(len(stems) * 0.1)) if len(stems) > 2 else 0)
 
-        # load train/val splits
-        if stage in ("fit", "validate"):
-            self.val_items = []
-            self.train_items = []
-            split_file = "8-folds.split" if self.fold is not None else "single.split"
-            for dataset_dir in annotation_dir.iterdir():
-                if not dataset_dir.is_dir() or not (dataset_dir / split_file).exists():
-                    continue
-                dataset = dataset_dir.name
-                if dataset != "harmonix":
-                    continue
-                if dataset == self.test_set_name:
-                    continue
-                split = pd.read_csv(
-                    dataset_dir / split_file,
-                    header=None,
-                    names=["piece", "part"],
-                    sep="\t",
-                )
-                if self.fold is not None:
-                    # CV: use given fold for validation, rest for training
-                    self.val_items.extend(
-                        f"{dataset}/{stem}"
-                        for stem in split.piece[split.part == self.fold]
-                    )
-                    self.train_items.extend(
-                        f"{dataset}/{stem}"
-                        for stem in split.piece[split.part != self.fold]
-                    )
-                else:
-                    # single split: marked as val and train
-                    self.val_items.extend(
-                        f"{dataset}/{stem}" for stem in split.piece[split.part == "val"]
-                    )
-                    self.train_items.extend(
-                        f"{dataset}/{stem}"
-                        for stem in split.piece[split.part == "train"]
-                    )
-            if self.no_val:
-                # Train on all available data (excluding the test set).
-                # For compatibility, validation metrics are still computed
-                # on the original validation set now included in training.
-                self.train_items.extend(self.val_items)
-            if self.hung_data:
-                self.train_items = [item for item in self.train_items if item.startswith("harmonix/")]
-            self.val_items.sort()
-            self.train_items.sort()
+        self.test_items = stems[-test_cut:] if test_cut else stems
+        remaining = stems[:-test_cut] if test_cut else stems
+        self.val_items = remaining[-val_cut:] if val_cut else []
+        self.train_items = remaining if self.no_val else remaining[:-val_cut] or remaining
 
-        # load validation set
         if stage in ("fit", "validate"):
             self.val_dataset = PhraseBoundaryDataset(
                 self.val_items,
@@ -328,16 +246,11 @@ class PhraseDataModule(pl.LightningDataModule):
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                mel_suffix=self.mel_suffix,
             )
-            print(
-                "Validation set:",
-                len(self.val_dataset),
-                "items from:",
-                *sorted(set(item.split("/", 1)[0] for item in self.val_items)),
-            )
+            print("Validation set:", len(self.val_dataset), "items")
             self.initialized["validate"] = True
 
-        # load training set
         if stage == "fit":
             self.train_dataset = PhraseBoundaryDataset(
                 self.train_items,
@@ -347,24 +260,12 @@ class PhraseDataModule(pl.LightningDataModule):
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
                 length_based_oversampling_factor=self.length_based_oversampling_factor,
+                mel_suffix=self.mel_suffix,
             )
-            print(
-                "Training set:",
-                len(self.train_dataset),
-                "items from:",
-                *sorted(set(item.split("/", 1)[0] for item in self.train_items)),
-            )
+            print("Training set:", len(self.train_dataset), "items")
             self.initialized["fit"] = True
 
-        # load test set
         if stage == "test":
-            test_annotations_dir = (
-                annotation_dir / self.test_set_name / "annotations" / "phrase_changes"
-            )
-            self.test_items = sorted(
-                f"{self.test_set_name}/{item.stem}"
-                for item in test_annotations_dir.glob("*.txt")
-            )
             self.test_dataset = PhraseBoundaryDataset(
                 self.test_items,
                 deterministic=True,
@@ -372,26 +273,22 @@ class PhraseDataModule(pl.LightningDataModule):
                 train_length=None,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                mel_suffix=self.mel_suffix,
             )
-            print(
-                "Test set:", len(self.test_dataset), "items from:", self.test_set_name
-            )
+            print("Test set:", len(self.test_dataset), "items")
             self.initialized["test"] = True
 
-        # load prediction set
         if stage == "predict":
             if self.predict_datasplit == "test":
                 self.setup("test")
-                # we can directly use the test dataset for predictions
                 self.predict_dataset = self.test_dataset
             else:
                 if self.predict_datasplit == "train":
                     self.setup("fit")
                     items = self.train_items
-                elif self.predict_datasplit == "val":
+                else:
                     self.setup("validate")
                     items = self.val_items
-                # for prediction, we want to use full items (train_length=None)
                 self.predict_dataset = PhraseBoundaryDataset(
                     items,
                     deterministic=True,
@@ -399,7 +296,22 @@ class PhraseDataModule(pl.LightningDataModule):
                     train_length=None,
                     data_folder=self.data_dir,
                     spect_fps=self.spect_fps,
+                    mel_suffix=self.mel_suffix,
                 )
+            self.initialized["predict"] = True
+
+    def _available_stems(self):
+        stems = []
+        for mel in sorted(self.data_dir.glob(f"*{self.mel_suffix}")):
+            stem = mel.stem
+            if self.mel_suffix_no_ext:
+                stem = stem.removesuffix(self.mel_suffix_no_ext)
+            annotation_path = self.data_dir / "harmonixset" / "dataset" / "segments" / f"{stem}.txt"
+            if annotation_path.exists():
+                stems.append(stem)
+            else:
+                print(f"Skipping {stem} because segment annotation is missing at {annotation_path}.")
+        return stems
 
     def train_dataloader(self):
         return DataLoader(
