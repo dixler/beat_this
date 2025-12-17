@@ -1,1 +1,1 @@
-from beat_this.dataset.dataset import BeatDataModule
+from beat_this.dataset.dataset import PhraseDataModule

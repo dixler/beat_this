@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from beat_this.model.beat_tracker import BeatThis
 from beat_this.model.postprocessor import Postprocessor
 from beat_this.preprocessing import LogMelSpect, load_audio
-from beat_this.utils import replace_state_dict_key, save_beat_tsv
+from beat_this.utils import replace_state_dict_key, save_boundary_tsv
 
 CHECKPOINT_URL = "https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp"
 
@@ -145,46 +145,21 @@ def aggregate_prediction(
     border_size: int,
     overlap_mode: str,
     device: str | torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Aggregates the predictions for the whole piece based on the given prediction chunks.
-
-    Args:
-        pred_chunks (list): List of prediction chunks, where each chunk is a dictionary containing 'beat' and 'downbeat' predictions.
-        starts (list): List of start positions for each prediction chunk.
-        full_size (int): Size of the full piece.
-        chunk_size (int): Size of each prediction chunk.
-        border_size (int): Size of the border to be discarded from each prediction chunk.
-        overlap_mode (str): Mode for handling overlapping predictions. Can be 'keep_first' or 'keep_last'.
-        device (torch.device): Device to be used for the predictions.
-
-    Returns:
-        tuple: A tuple containing the aggregated beat predictions and downbeat predictions as torch tensors for the whole piece.
-    """
+) -> torch.Tensor:
     if border_size > 0:
-        # cut the predictions to discard the border
         pred_chunks = [
-            {
-                "beat": pchunk["beat"][border_size:-border_size],
-                "downbeat": pchunk["downbeat"][border_size:-border_size],
-            }
+            {"boundary": pchunk["boundary"][border_size:-border_size]}
             for pchunk in pred_chunks
         ]
-    # aggregate the predictions for the whole piece
-    piece_prediction_beat = torch.full((full_size,), -1000.0, device=device)
-    piece_prediction_downbeat = torch.full((full_size,), -1000.0, device=device)
+    piece_prediction = torch.full((full_size,), -1000.0, device=device)
     if overlap_mode == "keep_first":
-        # process in reverse order, so predictions of earlier excerpts overwrite later ones
         pred_chunks = reversed(list(pred_chunks))
         starts = reversed(list(starts))
     for start, pchunk in zip(starts, pred_chunks):
-        piece_prediction_beat[
+        piece_prediction[
             start + border_size : start + chunk_size - border_size
-        ] = pchunk["beat"]
-        piece_prediction_downbeat[
-            start + border_size : start + chunk_size - border_size
-        ] = pchunk["downbeat"]
-    return piece_prediction_beat, piece_prediction_downbeat
+        ] = pchunk["boundary"]
+    return piece_prediction
 
 
 def split_predict_aggregate(
@@ -207,7 +182,7 @@ def split_predict_aggregate(
         model (torch.nn.Module): the model to run
 
     Returns:
-        dict: the model framewise predictions for the hole piece as a dictionary containing 'beat' and 'downbeat' predictions.
+        dict: the model framewise predictions for the whole piece as boundary logits.
     """
     # split the piece into chunks
     chunks, starts = split_piece(
@@ -215,11 +190,8 @@ def split_predict_aggregate(
     )
     # run the model
     pred_chunks = [model(chunk.unsqueeze(0)) for chunk in chunks]
-    # remove the extra dimension in beat and downbeat prediction due to batch size 1
-    pred_chunks = [
-        {"beat": p["beat"][0], "downbeat": p["downbeat"][0]} for p in pred_chunks
-    ]
-    piece_prediction_beat, piece_prediction_downbeat = aggregate_prediction(
+    pred_chunks = [{"boundary": p["boundary"][0]} for p in pred_chunks]
+    piece_prediction_boundary = aggregate_prediction(
         pred_chunks,
         starts,
         spect.shape[0],
@@ -228,13 +200,12 @@ def split_predict_aggregate(
         overlap_mode,
         spect.device,
     )
-    # save it to model_prediction
-    return {"beat": piece_prediction_beat, "downbeat": piece_prediction_downbeat}
+    return {"boundary": piece_prediction_boundary}
 
 
 class Spect2Frames:
     """
-    Class for extracting framewise beat and downbeat predictions (logits) from a spectrogram.
+    Class for extracting framewise phrase boundary predictions (logits) from a spectrogram.
     """
 
     def __init__(self, checkpoint_path="final0", device="cpu", float16=False):
@@ -248,21 +219,19 @@ class Spect2Frames:
             with torch.autocast(enabled=self.float16, device_type=self.device.type):
                 model_prediction = split_predict_aggregate(
                     spect=spect,
-                    chunk_size=1500,
+                    chunk_size=spect.shape[0],
                     overlap_mode="keep_first",
-                    border_size=6,
+                    border_size=0,
                     model=self.model,
                 )
-        return model_prediction["beat"].float(), model_prediction["downbeat"].float()
+        return model_prediction["boundary"].float()
 
     def __call__(self, spect):
         return self.spect2frames(spect)
 
 
 class Audio2Frames(Spect2Frames):
-    """
-    Class for extracting framewise beat and downbeat predictions (logits) from an audio tensor.
-    """
+    """Extract framewise boundary logits from an audio tensor."""
 
     def __init__(self, checkpoint_path="final0", device="cpu", float16=False):
         super().__init__(checkpoint_path, device, float16)
@@ -283,35 +252,25 @@ class Audio2Frames(Spect2Frames):
         return self.spect2frames(spect)
 
 
-class Audio2Beats(Audio2Frames):
-    """
-    Class for extracting beat and downbeat positions (in seconds) from an audio tensor.
+class Audio2Boundaries(Audio2Frames):
+    """Extract phrase change times (seconds) from an audio tensor."""
 
-    Args:
-        checkpoint_path (str): Path to the model checkpoint file. It can be a local path, a URL, or a key from the CHECKPOINT_URL dictionary. Default is "final0", which will load the model trained on all data except GTZAN with seed 0.
-        device (str): Device to use for inference. Default is "cpu".
-        float16 (bool): Whether to use half precision floating point arithmetic. Default is False.
-        dbn (bool): Whether to use the madmom DBN for post-processing. Default is False.
-    """
-
-    def __init__(
-        self, checkpoint_path="final0", device="cpu", float16=False, dbn=False
-    ):
+    def __init__(self, checkpoint_path="final0", device="cpu", float16=False):
         super().__init__(checkpoint_path, device, float16)
-        self.frames2beats = Postprocessor(type="dbn" if dbn else "minimal")
+        self.frames2boundaries = Postprocessor(type="minimal")
 
     def __call__(self, signal, sr):
-        beat_logits, downbeat_logits = super().__call__(signal, sr)
-        return self.frames2beats(beat_logits, downbeat_logits)
+        boundary_logits = super().__call__(signal, sr)
+        return self.frames2boundaries(boundary_logits, None)
 
 
-class File2Beats(Audio2Beats):
+class File2Boundaries(Audio2Boundaries):
     def __call__(self, audio_path):
         signal, sr = load_audio(audio_path)
         return super().__call__(signal, sr)
 
 
-class File2File(File2Beats):
+class File2File(File2Boundaries):
     def __call__(self, audio_path, output_path):
-        downbeats, beats = super().__call__(audio_path)
-        save_beat_tsv(downbeats, beats, output_path)
+        boundaries = super().__call__(audio_path)
+        save_boundary_tsv(boundaries, output_path)

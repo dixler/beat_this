@@ -3,10 +3,8 @@ Pytorch Lightning module, wraps a BeatThis model along with losses, metrics and
 optimizers for training.
 """
 
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-import mir_eval
 import numpy as np
 import torch
 from pytorch_lightning import LightningModule
@@ -30,13 +28,14 @@ class PLBeatThis(LightningModule):
         dropout={"frontend": 0.1, "transformer": 0.2},
         lr=0.0008,
         weight_decay=0.01,
-        pos_weights={"beat": 1, "downbeat": 1},
+        pos_weights={"boundary": 1},
         head_dim=32,
         loss_type="shift_tolerant_weighted_bce",
         warmup_steps=1000,
         max_epochs=100,
         use_dbn=False,
-        eval_trim_beats=5,
+        eval_trim_beats=None,
+        eval_tolerance=0.5,
         sum_head=True,
         partial_transformers=True,
     ):
@@ -62,28 +61,18 @@ class PLBeatThis(LightningModule):
         # set up the losses
         self.pos_weights = pos_weights
         if loss_type == "shift_tolerant_weighted_bce":
-            self.beat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
-                pos_weight=pos_weights["beat"]
-            )
-            self.downbeat_loss = beat_this.model.loss.ShiftTolerantBCELoss(
-                pos_weight=pos_weights["downbeat"]
+            self.boundary_loss = beat_this.model.loss.ShiftTolerantBCELoss(
+                pos_weight=pos_weights["boundary"]
             )
         elif loss_type == "weighted_bce":
-            self.beat_loss = beat_this.model.loss.MaskedBCELoss(
-                pos_weight=pos_weights["beat"]
-            )
-            self.downbeat_loss = beat_this.model.loss.MaskedBCELoss(
-                pos_weight=pos_weights["downbeat"]
+            self.boundary_loss = beat_this.model.loss.MaskedBCELoss(
+                pos_weight=pos_weights["boundary"]
             )
         elif loss_type == "bce":
-            self.beat_loss = beat_this.model.loss.MaskedBCELoss()
-            self.downbeat_loss = beat_this.model.loss.MaskedBCELoss()
+            self.boundary_loss = beat_this.model.loss.MaskedBCELoss()
         elif loss_type == "splitted_shift_tolerant_weighted_bce":
-            self.beat_loss = beat_this.model.loss.SplittedShiftTolerantBCELoss(
-                pos_weight=pos_weights["beat"]
-            )
-            self.downbeat_loss = beat_this.model.loss.SplittedShiftTolerantBCELoss(
-                pos_weight=pos_weights["downbeat"]
+            self.boundary_loss = beat_this.model.loss.SplittedShiftTolerantBCELoss(
+                pos_weight=pos_weights["boundary"]
             )
         else:
             raise ValueError(
@@ -91,89 +80,46 @@ class PLBeatThis(LightningModule):
             )
 
         self.postprocessor = Postprocessor(
-            type="dbn" if use_dbn else "minimal", fps=fps
+            type="minimal", fps=fps
         )
-        self.eval_trim_beats = eval_trim_beats
-        self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
+        self.metrics = Metrics(eval_tolerance=eval_tolerance)
 
     def _compute_loss(self, batch, model_prediction):
-        beat_mask = batch["padding_mask"]
-        beat_loss = self.beat_loss(
-            model_prediction["beat"], batch["truth_beat"].float(), beat_mask
+        boundary_mask = batch["padding_mask"]
+        boundary_loss = self.boundary_loss(
+            model_prediction["boundary"],
+            batch["truth_boundary"].float(),
+            boundary_mask,
         )
-        # downbeat mask considers padding and also pieces which don't have downbeat annotations
-        downbeat_mask = beat_mask * batch["downbeat_mask"][:, None]
-        downbeat_loss = self.downbeat_loss(
-            model_prediction["downbeat"], batch["truth_downbeat"].float(), downbeat_mask
-        )
-        # sum the losses and return them in a dictionary for logging
+        return {"boundary": boundary_loss, "total": boundary_loss}
+
+    def _compute_metrics(self, batch, postp_boundary, step="val"):
+        def compute_item(pred, truth_orig):
+            piece_truth_time = np.frombuffer(truth_orig)
+            return self.metrics(piece_truth_time, pred)
+
+        if not isinstance(postp_boundary, tuple):
+            postp_boundary = (postp_boundary,)
+
+        piecewise_metrics = [
+            compute_item(pred, truth)
+            for pred, truth in zip(postp_boundary, batch["truth_orig_boundary"])
+        ]
         return {
-            "beat": beat_loss,
-            "downbeat": downbeat_loss,
-            "total": beat_loss + downbeat_loss,
-        }
-
-    def _compute_metrics(self, batch, postp_beat, postp_downbeat, step="val"):
-        """ """
-        # compute for beat
-        metrics_beat = self._compute_metrics_target(
-            batch, postp_beat, target="beat", step=step
-        )
-        # compute for downbeat
-        metrics_downbeat = self._compute_metrics_target(
-            batch, postp_downbeat, target="downbeat", step=step
-        )
-
-        # concatenate dictionaries
-        metrics = {**metrics_beat, **metrics_downbeat}
-
-        return metrics
-
-    def _compute_metrics_target(self, batch, postp_target, target, step):
-
-        def compute_item(pospt_pred, truth_orig_target):
-            # take the ground truth from the original version, so there are no quantization errors
-            piece_truth_time = np.frombuffer(truth_orig_target)
-            # run evaluation
-            metrics = self.metrics(piece_truth_time, pospt_pred, step=step)
-
-            return metrics
-
-        # if the input was not batched, postp_target is an array instead of a tuple of arrays
-        # make it a tuple for consistency
-        if not isinstance(postp_target, tuple):
-            postp_target = (postp_target,)
-
-        with ThreadPoolExecutor() as executor:
-            piecewise_metrics = list(
-                executor.map(
-                    compute_item,
-                    postp_target,
-                    batch[f"truth_orig_{target}"],
-                )
-            )
-
-        # average the beat metrics across the dictionary
-        batch_metric = {
-            key + f"_{target}": np.mean([x[key] for x in piecewise_metrics])
+            key: np.mean([x[key] for x in piecewise_metrics])
             for key in piecewise_metrics[0].keys()
         }
 
-        return batch_metric
-
     def log_losses(self, losses, batch_size, step="train"):
-        # log for separate targets
-        for target in "beat", "downbeat":
-            self.log(
-                f"{step}_loss_{target}",
-                losses[target].item(),
-                prog_bar=False,
-                on_step=False,
-                on_epoch=True,
-                batch_size=batch_size,
-                sync_dist=True,
-            )
-        # log total loss
+        self.log(
+            f"{step}_loss_boundary",
+            losses["boundary"].item(),
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+            sync_dist=True,
+        )
         self.log(
             f"{step}_loss",
             losses["total"].item(),
@@ -209,14 +155,11 @@ class PLBeatThis(LightningModule):
         model_prediction = self.model(batch["spect"])
         # compute loss
         losses = self._compute_loss(batch, model_prediction)
-        # postprocess the predictions
-        postp_beat, postp_downbeat = self.postprocessor(
-            model_prediction["beat"],
-            model_prediction["downbeat"],
+        postp_boundary = self.postprocessor(
+            model_prediction["boundary"],
             batch["padding_mask"],
         )
-        # compute the metrics
-        metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="val")
+        metrics = self._compute_metrics(batch, postp_boundary, step="val")
         # log
         self.log_losses(losses, len(batch["spect"]), "val")
         self.log_metrics(metrics, batch["spect"].shape[0], "val")
@@ -233,7 +176,7 @@ class PLBeatThis(LightningModule):
         batch: Any,
         batch_idx: int,
         dataloader_idx: int = 0,
-        chunk_size: int = 1500,
+        chunk_size: int | None = None,
         overlap_mode: str = "keep_first",
     ) -> Any:
         """
@@ -256,24 +199,24 @@ class PLBeatThis(LightningModule):
             )
         # compute border size according to the loss type
         if hasattr(
-            self.beat_loss, "tolerance"
+            self.boundary_loss, "tolerance"
         ):  # discard the edges that are affected by the max-pooling in the loss
-            border_size = 2 * self.beat_loss.tolerance
+            border_size = 2 * self.boundary_loss.tolerance
         else:
             border_size = 0
+        window = chunk_size or batch["spect"].shape[1]
         model_prediction = split_predict_aggregate(
-            batch["spect"][0], chunk_size, border_size, overlap_mode, self.model
+            batch["spect"][0], window, border_size, overlap_mode, self.model
         )
         # add the batch dimension back in the prediction for consistency
         model_prediction = {
             key: value.unsqueeze(0) for key, value in model_prediction.items()
         }
         # postprocess the predictions
-        postp_beat, postp_downbeat = self.postprocessor(
-            model_prediction["beat"], model_prediction["downbeat"], None
+        postp_boundary = self.postprocessor(
+            model_prediction["boundary"], None
         )
-        # compute the metrics
-        metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="test")
+        metrics = self._compute_metrics(batch, postp_boundary, step="test")
         return metrics, model_prediction, batch["dataset"], batch["spect_path"]
 
     def configure_optimizers(self):
@@ -318,25 +261,28 @@ class PLBeatThis(LightningModule):
 
 
 class Metrics:
-    def __init__(self, eval_trim_beats: int) -> None:
-        self.min_beat_time = eval_trim_beats
+    def __init__(self, eval_tolerance: float) -> None:
+        self.tolerance = eval_tolerance
 
-    def __call__(self, truth, preds, step) -> Any:
-        truth = mir_eval.beat.trim_beats(truth, min_beat_time=self.min_beat_time)
-        preds = mir_eval.beat.trim_beats(preds, min_beat_time=self.min_beat_time)
-        if (
-            step == "val"
-        ):  # limit the metrics that are computed during validation to speed up training
-            fmeasure = mir_eval.beat.f_measure(truth, preds)
-            cemgil = mir_eval.beat.cemgil(truth, preds)
-            return {"F-measure": fmeasure, "Cemgil": cemgil}
-        elif step == "test":  # compute all metrics during testing
-            CMLc, CMLt, AMLc, AMLt = mir_eval.beat.continuity(truth, preds)
-            fmeasure = mir_eval.beat.f_measure(truth, preds)
-            cemgil = mir_eval.beat.cemgil(truth, preds)
-            return {"F-measure": fmeasure, "Cemgil": cemgil, "CMLt": CMLt, "AMLt": AMLt}
-        else:
-            raise ValueError("step must be either val or test")
+    def __call__(self, truth, preds) -> Any:
+        if len(truth) == 0 and len(preds) == 0:
+            return {"Precision": 1.0, "Recall": 1.0, "F-measure": 1.0}
+        matched = set()
+        tp = 0
+        for pred in preds:
+            diffs = np.abs(truth - pred)
+            idx = np.argmin(diffs) if len(diffs) else None
+            if idx is not None and diffs[idx] <= self.tolerance and idx not in matched:
+                matched.add(idx)
+                tp += 1
+        precision = tp / max(len(preds), 1)
+        recall = tp / max(len(truth), 1)
+        fmeasure = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
+        return {"Precision": precision, "Recall": recall, "F-measure": fmeasure}
 
 
 class CosineWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):

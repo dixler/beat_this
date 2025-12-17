@@ -1,12 +1,17 @@
 import argparse
 from pathlib import Path
 
+import sys
 import torch
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
-from beat_this.dataset import BeatDataModule
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from beat_this.dataset import PhraseDataModule
 from beat_this.model.pl_module import PLBeatThis
 
 
@@ -35,7 +40,7 @@ def main(args):
         torch.backends.cuda.enable_mem_efficient_sdp(False)
         torch.backends.cuda.enable_math_sdp(False)
 
-    data_dir = Path(__file__).parent.parent.relative_to(Path.cwd()) / "data"
+    data_dir = Path(args.data_dir)
     checkpoint_dir = (
         Path(__file__).parent.parent.relative_to(Path.cwd()) / "checkpoints"
     )
@@ -56,18 +61,18 @@ def main(args):
             "max_parts": 9,
         }
 
-    datamodule = BeatDataModule(
+    datamodule = PhraseDataModule(
         data_dir,
         batch_size=args.batch_size,
         train_length=args.train_length,
         spect_fps=args.fps,
         num_workers=args.num_workers,
-        test_dataset="gtzan",
         length_based_oversampling_factor=args.length_based_oversampling_factor,
         augmentations=augmentations,
         hung_data=args.hung_data,
         no_val=not args.val,
         fold=args.fold,
+        segment_dir=args.segment_dir,
     )
     datamodule.setup(stage="fit")
 
@@ -79,8 +84,8 @@ def main(args):
         "transformer": args.transformer_dropout,
     }
     pl_model = PLBeatThis(
-        spect_dim=128,
-        fps=50,
+        spect_dim=datamodule.spect_dim,
+        fps=datamodule.spect_fps,
         transformer_dim=args.transformer_dim,
         ff_mult=4,
         n_layers=args.n_layers,
@@ -165,8 +170,17 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--logger", type=str, choices=["wandb", "none"], default="none")
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--data-dir", type=Path, default=Path.home() / "Data" / "harmonix")
+    parser.add_argument(
+        "--segment-dir",
+        type=Path,
+        default=None,
+        help="Path to Harmonix segment annotations (defaults to <data-dir>/harmonixset/dataset/segments).",
+    )
     parser.add_argument("--n-heads", type=int, default=16)
-    parser.add_argument("--fps", type=int, default=50, help="The spectrograms fps.")
+    parser.add_argument(
+        "--fps", type=float, default=None, help="Override spectrogram fps; defaults to info.json."
+    )
     parser.add_argument(
         "--loss",
         type=str,

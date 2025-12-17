@@ -1,6 +1,9 @@
 from itertools import chain
 from pathlib import Path
 
+from itertools import chain
+from pathlib import Path
+
 import numpy as np
 
 
@@ -100,6 +103,17 @@ def save_beat_tsv(beats: np.ndarray, downbeats: np.ndarray, outpath: str) -> Non
             f.writelines(f"{beat}\t{number}\n" for beat, number in zip(beats, numbers))
     except KeyboardInterrupt:
         outpath.unlink()  # avoid half-written files
+
+
+def save_boundary_tsv(boundaries: np.ndarray, outpath: str) -> None:
+    """Save phrase change boundaries as a one-column TSV."""
+
+    Path(outpath).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(outpath, "w") as f:
+            f.writelines(f"{time}\n" for time in boundaries)
+    except KeyboardInterrupt:
+        outpath.unlink()
 
 
 def replace_state_dict_key(state_dict: dict, old: str, new: str):

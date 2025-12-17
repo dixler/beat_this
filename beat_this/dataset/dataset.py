@@ -1,68 +1,54 @@
 import concurrent.futures
 import itertools
 import json
-import re
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from beat_this.dataset.augment import (
-    augment_mask_,
-    augment_pitchtempo,
-    precomputed_augmentation_filenames,
-)
+from beat_this.dataset.augment import augment_mask_, augment_pitchtempo
 from beat_this.utils import index_to_framewise
 
-from .mmnpz import MemmappedNpzFile
 
-
-class BeatTrackingDataset(Dataset):
+class PhraseBoundaryDataset(Dataset):
     """
-    A PyTorch Dataset for beat tracking. This dataset loads preprocessed spectrograms and beat annotations
-    from a given data folder and provides them for training or evaluation.
-
-    Args:
-        item_names (list of str): A list of dataset items such as "gtzan/gtzan_rock_00099".
-        data_folder (Path or str): The base folder where the data is stored.
-        spect_fps (int, optional): The frames per second of the spectrograms. Defaults to 50.
-        train_length (int, optional): The length of the training sequences in frames. If None the entire piece is used. Defaults to 1500.
-        deterministic (bool, optional): If True, the dataset always returns the same sequence for a given index.
-            Defaults to False.
-        augmentations (dict, optional): A dictionary of data augmentations to apply. Possible keys are "tempo", "pitch", and "mask". Defaults to an empty dictionary.
+    A PyTorch Dataset for phrase boundary detection using HarmonixSet annotations.
     """
 
     def __init__(
         self,
         item_names: list[str],
         data_folder,
-        spect_fps=50,
-        train_length=1500,
+        spect_fps,
+        spect_dim,
+        train_length=None,
         deterministic=False,
         augmentations={},
         length_based_oversampling_factor=0,
+        mel_suffix="-mel.npy",
+        segment_dir=None,
     ):
-        self.spect_basepath = data_folder / "audio" / "spectrograms"
-        self.annotation_basepath = data_folder / "annotations"
+        self.data_folder = Path(data_folder)
+        self.spect_basepath = self.data_folder
+        self.segment_dir = (
+            Path(segment_dir)
+            if segment_dir is not None
+            else self.data_folder / "harmonixset" / "dataset" / "segments"
+        )
+        self.mel_suffix = mel_suffix
         self.fps = spect_fps
         self.train_length = train_length
         self.deterministic = deterministic
         self.augmentations = augmentations
         self.length_based_oversampling_factor = length_based_oversampling_factor
-        datasets = sorted(set(name.split("/", 1)[0] for name in item_names))
-        # load dataset info
-        self.dataset_info = self._load_dataset_infos(datasets)
-        # load .npz spectrogram bundles, if any
-        self.spects = self._load_spect_bundles(datasets)
+        self.spect_dim = spect_dim
         # load the annotations in parallel
         with concurrent.futures.ThreadPoolExecutor() as executor:
             items = executor.map(self._load_dataset_item, item_names)
         items = [item for item in items if item is not None]
         if self.length_based_oversampling_factor and self.train_length is not None:
-            # oversample the dataset according to the audio lengths, so that long pieces are sampled more often
             oversampled_items = []
             for item in items:
                 oversampling_factor = np.round(
@@ -78,90 +64,72 @@ class BeatTrackingDataset(Dataset):
             items = oversampled_items
         self.items = items
 
-    def _load_dataset_infos(self, datasets):
-        dataset_info = {}
-        for dataset in datasets:
-            with open(self.annotation_basepath / dataset / "info.json") as f:
-                dataset_info[dataset] = json.load(f)
-        return dataset_info
+    def _load_dataset_item(self, stem: str):
+        spect_path = self.spect_basepath / f"{stem}{self.mel_suffix}"
+        if not spect_path.exists():
+            print(f"Skipping {stem} because mel spectrogram is missing at {spect_path}.")
+            return
 
-    def _load_spect_bundles(self, datasets):
-        spects = {}
-        for dataset in datasets:
-            npz_file = (self.spect_basepath / dataset).with_suffix(".npz")
-            if npz_file.exists():
-                spects[dataset] = MemmappedNpzFile(npz_file)
-        return spects
+        annotation_path = self.segment_dir / f"{stem}.txt"
+        if not annotation_path.exists():
+            print(f"Skipping {stem} because segment annotation is missing at {annotation_path}.")
+            return
 
-    def _load_dataset_item(self, item_name):
-        # stop if not all the augmented audio files are there
-        dataset, remainder = item_name.split("/", 1)
-        for aug_filename in precomputed_augmentation_filenames(self.augmentations):
-            if (f"{remainder}/{aug_filename[:-4]}") not in self.spects.get(
-                dataset, ()
-            ) and not (self.spect_basepath / item_name / aug_filename).exists():
-                print(
-                    f"Skipping {item_name} because not all necessary spectrograms are there."
-                )
-                return
+        try:
+            boundary_times = np.loadtxt(annotation_path, ndmin=1, usecols=[0])
+        except Exception:
+            print(f"Skipping {stem} because annotations could not be read from {annotation_path}.")
+            return
+        boundary_times = boundary_times[1:] if boundary_times.size else boundary_times
 
-        # load beat and produce a default if beat values are not found
-        dataset, stem = item_name.split("/", 1)
-        annotation_path = (
-            self.annotation_basepath
-            / dataset
-            / "annotations"
-            / "beats"
-            / (stem + ".beats")
-        )
-        beat_annotation = np.loadtxt(annotation_path)
-        if beat_annotation.ndim == 2:
-            beat_time = beat_annotation[:, 0]
-            beat_value = beat_annotation[:, 1].astype(int)
-        else:
-            beat_time = beat_annotation
-            beat_value = np.zeros_like(beat_time, dtype=np.int32)
-
-        # stop if the annotations that are supposed to be there are not there
-        if self.dataset_info[dataset]["has_downbeats"]:
-            if beat_annotation.ndim != 2:
-                print(
-                    f"Skipping {item_name} because it has {beat_annotation.ndim} columns but downbeat is supposed to be there."
-                )
-                return
-
-        # create a downbeat mask to handle the case where the downbeat is not annotated
-        downbeat_mask = self.dataset_info[dataset]["has_downbeats"]
-        # take care of different subsections of rwc for the dataset name
-        if dataset == "rwc":
-            dataset = "rwc_" + stem.split("_", 2)[1]
         return {
-            "spect_path": Path(item_name) / "track.npy",
-            "beat_time": beat_time,
-            "beat_value": beat_value,
-            "downbeat_mask": downbeat_mask,
-            "dataset": dataset,
+            "spect_path": spect_path,
+            "base_spect_path": spect_path,
+            "boundary_time": boundary_times,
+            "dataset": "harmonix",
         }
 
-    def _get_spect(self, item):
-        try:
-            dataset, filename = str(item["spect_path"]).split("/", 1)
-            spect = self.spects[dataset][filename[:-4]]
-        except KeyError:
-            spect = np.load(self.spect_basepath / item["spect_path"], mmap_mode="r")
-        return spect
+    def _resolve_spect_path(self, item):
+        spect_path = Path(item["spect_path"])
+        if spect_path.exists():
+            return spect_path
+
+        base_path = Path(item.get("base_spect_path", spect_path))
+        if base_path.exists():
+            print(
+                f"Falling back to base spectrogram for {spect_path.name} at {base_path}."
+            )
+            return base_path
+
+        raise FileNotFoundError(
+            f"Missing spectrogram for {spect_path}. Checked base path {base_path} as well."
+        )
+
+    def _get_spect(self, item, spect_path=None):
+        spect_path = self._resolve_spect_path(item) if spect_path is None else spect_path
+        spect = np.load(spect_path, mmap_mode="r")
+        spect = np.asarray(spect)
+        if spect.ndim != 2:
+            raise ValueError(
+                f"Expected 2D spectrogram, got shape {spect.shape} for {item['spect_path']}"
+            )
+
+        if spect.shape[1] == self.spect_dim:
+            return spect
+        if spect.shape[0] == self.spect_dim:
+            return spect.T
+
+        raise ValueError(
+            f"Could not infer time/mel axes for {item['spect_path']} with shape {spect.shape}"
+        )
 
     def get_frame_count(self, index):
         """Return number of frames of given item."""
         return len(self._get_spect(self.items[index]))
 
-    def get_beat_count(self, index):
-        """Return number of beats (including downbeats) of given item."""
-        return len(self.items[index]["beat_time"])
-
-    def get_downbeat_count(self, index):
-        """Return number of downbeats of given item."""
-        return (self.items[index]["beat_value"] == 1).sum()
+    def get_boundary_count(self, index):
+        """Return number of phrase changes of given item."""
+        return len(self.items[index]["boundary_time"])
 
     def __len__(self):
         return len(self.items)
@@ -174,7 +142,8 @@ class BeatTrackingDataset(Dataset):
             item = augment_pitchtempo(item, self.augmentations)
 
             # load spectrogram
-            spect = self._get_spect(item)
+            spect_path = self._resolve_spect_path(item)
+            spect = self._get_spect(item, spect_path)
 
             # define the excerpt to use
             original_length = len(spect)
@@ -206,28 +175,23 @@ class BeatTrackingDataset(Dataset):
 
             # prepare annotations
             (
-                framewise_truth_beat,
-                framewise_truth_downbeat,
-                truth_orig_beat,
-                truth_orig_downbeat,
+                framewise_truth_boundary,
+                truth_orig_boundary,
             ) = prepare_annotations(item, start_frame, end_frame, self.fps)
 
             # restructure the item dict with the correct training information
             item = {
                 "spect": spect,
-                "spect_path": str(item["spect_path"]),
+                "spect_path": str(spect_path),
                 "dataset": item["dataset"],
                 "start_frame": start_frame,
-                "truth_beat": framewise_truth_beat,
-                "truth_downbeat": framewise_truth_downbeat,
-                "downbeat_mask": torch.as_tensor(item["downbeat_mask"]),
+                "truth_boundary": framewise_truth_boundary,
                 "padding_mask": (
                     np.ones(self.train_length, dtype=bool)
                     if self.train_length is not None
                     else np.ones(original_length, dtype=bool)
                 ),
-                "truth_orig_beat": truth_orig_beat,
-                "truth_orig_downbeat": truth_orig_downbeat,
+                "truth_orig_boundary": truth_orig_boundary,
             }
 
             # pad all framewise tensors if needed
@@ -235,8 +199,9 @@ class BeatTrackingDataset(Dataset):
                 item["spect"] = np.pad(
                     item["spect"], [(0, -longer), (0, 0)], constant_values=0
                 )
-                for k in "truth_beat", "truth_downbeat":
-                    item[k] = np.pad(item[k], [(0, -longer)], constant_values=0)
+                item["truth_boundary"] = np.pad(
+                    item["truth_boundary"], [(0, -longer)], constant_values=0
+                )
                 item["padding_mask"][longer:] = 0
             return item
 
@@ -244,50 +209,38 @@ class BeatTrackingDataset(Dataset):
             return [self[i] for i in index]
 
 
-class BeatDataModule(pl.LightningDataModule):
-    """
-    A PyTorch Lightning DataModule for beat tracking. This DataModule handles the loading and preprocessing of the
-    BeatTrackingDataset and prepares it for use with a PyTorch Lightning model.
-    It can produce cross-validation or single  train/val/test splits.
-
-    Args:
-        data_dir (Path or str): The parent directory where the data (spectrograms and beat labels) is stored.
-        batch_size (int, optional): The size of the batches to be generated by the DataLoader. Defaults to 8.
-        train_length (int, optional): The length of the subsequences in frames. If None, the entire pieces are returner. Defaults to 1500.
-        num_workers (int, optional): The number of worker processes to use for data loading. Defaults to 20.
-        augmentations (dict, optional): A dictionary of data augmentations to apply. Defaults to {"pitch": {"min": -5, "max": 6}, "time": {"min": -20, "max": 20, "stride": 4}}.
-        test_dataset (str, optional): The name of the dataset to use for testing. Defaults to "gtzan".
-        hung_data (bool, optional): If True, only use the datasets from the Hung et al. paper for training; validation is still on all datasets. Defaults to False.
-        no_val (bool, optional): If True, train on all train+val data and do not use a validation set; for compatibility reason, the validation metrics are still computed, but are not meaningful. Defaults to False.
-        spect_fps (int, optional): The frames per second of the spectrograms. Defaults to 50.
-        length_based_oversampling_factor (int, optional): The factor by which to oversample the train dataset based on sequence length. Defaults to 0.
-        fold (int, optional): The fold number for cross-validation. If None, the single split is used. Defaults to None.
-        predict_datasplit (str, optional): The split to use for prediction. Prediction dataset is always full pieces. Defaults to "test".
-    """
+class PhraseDataModule(pl.LightningDataModule):
+    """Lightning DataModule wired for the local Harmonix mel/segment layout."""
 
     def __init__(
         self,
-        data_dir,
+        data_dir=Path.home() / "Data" / "harmonix",
         batch_size=8,
-        train_length=1500,
+        train_length=None,
         num_workers=20,
         augmentations={
             "pitch": {"min": -5, "max": 6},
             "tempo": {"min": -20, "max": 20, "stride": 4},
         },
-        test_dataset="gtzan",
+        test_dataset="harmonix",
         hung_data=False,
         no_val=False,
-        spect_fps=50,
+        spect_fps=None,
         length_based_oversampling_factor=0,
         fold=None,
         predict_datasplit="test",
+        mel_suffix="-mel.npy",
+        segment_dir=None,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.initialized = {}
-        # remember all arguments
         self.data_dir = Path(data_dir)
+        self.segment_dir = (
+            Path(segment_dir)
+            if segment_dir is not None
+            else self.data_dir / "harmonixset" / "dataset" / "segments"
+        )
         self.batch_size = batch_size
         self.train_length = train_length
         self.num_workers = num_workers
@@ -297,153 +250,126 @@ class BeatDataModule(pl.LightningDataModule):
         self.test_set_name = test_dataset
         self.hung_data = hung_data
         self.no_val = no_val
-        self.spect_fps = spect_fps
         self.length_based_oversampling_factor = length_based_oversampling_factor
         self.fold = fold
         self.predict_datasplit = predict_datasplit
+        self.mel_suffix = mel_suffix
+        suffix_ext = Path(mel_suffix).suffix
+        self.mel_suffix_no_ext = (
+            mel_suffix[: -len(suffix_ext)] if suffix_ext else mel_suffix
+        )
+
+        info_path = self.data_dir / "info.json"
+        self.dataset_info = json.loads(info_path.read_text()) if info_path.exists() else {}
+        derived_fps = None
+        if "SR" in self.dataset_info and "HOP_LENGTH" in self.dataset_info:
+            derived_fps = self.dataset_info["SR"] / self.dataset_info["HOP_LENGTH"]
+        self.spect_fps = spect_fps if spect_fps is not None else derived_fps or 50
+        self.spect_dim = self.dataset_info.get("N_MELS", 128)
 
     def setup(self, stage):
         if self.initialized.get(stage, False):
             return
+        stems = self._available_stems()
 
-        # set up the paths
-        annotation_dir = self.data_dir / "annotations"
+        test_cut = max(1, int(len(stems) * 0.1)) if len(stems) > 1 else 0
+        val_cut = 0 if self.no_val else (max(1, int(len(stems) * 0.1)) if len(stems) > 2 else 0)
 
-        # load train/val splits
+        self.test_items = stems[-test_cut:] if test_cut else stems
+        remaining = stems[:-test_cut] if test_cut else stems
+        self.val_items = remaining[-val_cut:] if val_cut else []
+        self.train_items = remaining if self.no_val else remaining[:-val_cut] or remaining
+
         if stage in ("fit", "validate"):
-            self.val_items = []
-            self.train_items = []
-            split_file = "8-folds.split" if self.fold is not None else "single.split"
-            for dataset_dir in annotation_dir.iterdir():
-                if not dataset_dir.is_dir() or not (dataset_dir / split_file).exists():
-                    continue
-                dataset = dataset_dir.name
-                if dataset == self.test_set_name:
-                    continue
-                split = pd.read_csv(
-                    dataset_dir / split_file,
-                    header=None,
-                    names=["piece", "part"],
-                    sep="\t",
-                )
-                if self.fold is not None:
-                    # CV: use given fold for validation, rest for training
-                    self.val_items.extend(
-                        f"{dataset}/{stem}"
-                        for stem in split.piece[split.part == self.fold]
-                    )
-                    self.train_items.extend(
-                        f"{dataset}/{stem}"
-                        for stem in split.piece[split.part != self.fold]
-                    )
-                else:
-                    # single split: marked as val and train
-                    self.val_items.extend(
-                        f"{dataset}/{stem}" for stem in split.piece[split.part == "val"]
-                    )
-                    self.train_items.extend(
-                        f"{dataset}/{stem}"
-                        for stem in split.piece[split.part == "train"]
-                    )
-            if self.no_val:
-                # Train on all available data (excluding the test set).
-                # For compatibility, validation metrics are still computed
-                # on the original validation set now included in training.
-                self.train_items.extend(self.val_items)
-            if self.hung_data:
-                # Use the training datasets from MODELING BEATS AND DOWNBEATS
-                # WITH A TIME-FREQUENCY TRANSFORMER (for comparability, the
-                # validation set stays the same, with all datasets).
-                regexp = re.compile(
-                    "^(hainsworth/|ballroom/|hjdb/|beatles/|rwc/rwc_popular|simac/|smc/|harmonix/|).*$"
-                )
-                self.train_items = [
-                    item for item in self.train_items if regexp.match(item)
-                ]
-            self.val_items.sort()
-            self.train_items.sort()
-
-        # load validation set
-        if stage in ("fit", "validate"):
-            self.val_dataset = BeatTrackingDataset(
+            self.val_dataset = PhraseBoundaryDataset(
                 self.val_items,
                 deterministic=True,
                 augmentations={},
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                spect_dim=self.spect_dim,
+                segment_dir=self.segment_dir,
+                mel_suffix=self.mel_suffix,
             )
-            print(
-                "Validation set:",
-                len(self.val_dataset),
-                "items from:",
-                *sorted(set(item.split("/", 1)[0] for item in self.val_items)),
-            )
+            print("Validation set:", len(self.val_dataset), "items")
             self.initialized["validate"] = True
 
-        # load training set
         if stage == "fit":
-            self.train_dataset = BeatTrackingDataset(
+            self.train_dataset = PhraseBoundaryDataset(
                 self.train_items,
                 deterministic=False,
                 augmentations=self.augmentations,
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                spect_dim=self.spect_dim,
                 length_based_oversampling_factor=self.length_based_oversampling_factor,
+                segment_dir=self.segment_dir,
+                mel_suffix=self.mel_suffix,
             )
-            print(
-                "Training set:",
-                len(self.train_dataset),
-                "items from:",
-                *sorted(set(item.split("/", 1)[0] for item in self.train_items)),
-            )
+            print("Training set:", len(self.train_dataset), "items")
             self.initialized["fit"] = True
 
-        # load test set
         if stage == "test":
-            test_annotations_dir = (
-                annotation_dir / self.test_set_name / "annotations" / "beats"
-            )
-            self.test_items = sorted(
-                f"{self.test_set_name}/{item.stem}"
-                for item in test_annotations_dir.glob("*.beats")
-            )
-            self.test_dataset = BeatTrackingDataset(
+            self.test_dataset = PhraseBoundaryDataset(
                 self.test_items,
                 deterministic=True,
                 augmentations={},
                 train_length=None,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                spect_dim=self.spect_dim,
+                segment_dir=self.segment_dir,
+                mel_suffix=self.mel_suffix,
             )
-            print(
-                "Test set:", len(self.test_dataset), "items from:", self.test_set_name
-            )
+            print("Test set:", len(self.test_dataset), "items")
             self.initialized["test"] = True
 
-        # load prediction set
         if stage == "predict":
             if self.predict_datasplit == "test":
                 self.setup("test")
-                # we can directly use the test dataset for predictions
                 self.predict_dataset = self.test_dataset
             else:
                 if self.predict_datasplit == "train":
                     self.setup("fit")
                     items = self.train_items
-                elif self.predict_datasplit == "val":
+                else:
                     self.setup("validate")
                     items = self.val_items
-                # for prediction, we want to use full items (train_length=None)
-                self.predict_dataset = BeatTrackingDataset(
+                self.predict_dataset = PhraseBoundaryDataset(
                     items,
                     deterministic=True,
                     augmentations={},
                     train_length=None,
                     data_folder=self.data_dir,
                     spect_fps=self.spect_fps,
+                    spect_dim=self.spect_dim,
+                    segment_dir=self.segment_dir,
+                    mel_suffix=self.mel_suffix,
                 )
+            self.initialized["predict"] = True
+
+    def _available_stems(self):
+        if not self.segment_dir.exists():
+            raise FileNotFoundError(
+                f"Segment annotations not found at {self.segment_dir}. "
+                "Pass an explicit segment_dir if your layout differs."
+            )
+
+        stems = []
+        for mel in sorted(self.data_dir.glob(f"*{self.mel_suffix}")):
+            stem = mel.stem
+            if self.mel_suffix_no_ext:
+                stem = stem.removesuffix(self.mel_suffix_no_ext)
+            annotation_path = self.segment_dir / f"{stem}.txt"
+            if annotation_path.exists():
+                stems.append(stem)
+            else:
+                print(
+                    f"Skipping {stem} because segment annotation is missing at {annotation_path}."
+                )
+        return stems
 
     def train_dataloader(self):
         return DataLoader(
@@ -453,21 +379,33 @@ class BeatDataModule(pl.LightningDataModule):
             shuffle=True,
             drop_last=True,
             pin_memory=True,
+            collate_fn=collate_phrase_batches,
         )
 
     def val_dataloader(self):
         # Warning: for performances, this only runs on the middle excerpt of the long pieces
         # The paper results are computed after training in the predict script
         return DataLoader(
-            self.val_dataset, batch_size=self.batch_size, num_workers=self.num_workers
+            self.val_dataset,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            collate_fn=collate_phrase_batches,
         )
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=1, num_workers=self.num_workers)
+        return DataLoader(
+            self.test_dataset,
+            batch_size=1,
+            num_workers=self.num_workers,
+            collate_fn=collate_phrase_batches,
+        )
 
     def predict_dataloader(self):
         return DataLoader(
-            self.predict_dataset, batch_size=1, num_workers=self.num_workers
+            self.predict_dataset,
+            batch_size=1,
+            num_workers=self.num_workers,
+            collate_fn=collate_phrase_batches,
         )
 
     def get_train_positive_weights(self, widen_target_mask=3):
@@ -478,79 +416,76 @@ class BeatDataModule(pl.LightningDataModule):
         frames around each positive label).
         For example a `widen_target_mask` of 3 will ignore 7 frames, 3 for each side plus the central.
         """
-        # find the positive weight for the loss as a ratio between (down)beat and non-(down)beat annotation
         dataset = self.train_dataset
-        all_frames = all_frames_db = 0
+        all_frames = 0
         for item in dataset.items:
             frames = len(dataset._get_spect(item))
             all_frames += frames
-            if item["downbeat_mask"]:
-                all_frames_db += frames
-        beat_frames = sum(len(item["beat_value"]) for item in dataset.items)
-        downbeat_frames = sum(
-            (item["beat_value"] == 1).sum()
-            for item in dataset.items
-            if item["downbeat_mask"]
-        )
+        boundary_frames = sum(len(item["boundary_time"]) for item in dataset.items)
 
         return {
-            "beat": int(
+            "boundary": int(
                 np.round(
-                    (all_frames - beat_frames * (widen_target_mask * 2 + 1))
-                    / beat_frames
+                    (all_frames - boundary_frames * (widen_target_mask * 2 + 1))
+                    / boundary_frames
                 )
-            ),
-            "downbeat": int(
-                np.round(
-                    (all_frames_db - downbeat_frames * (widen_target_mask * 2 + 1))
-                    / downbeat_frames
-                )
-            ),
+            )
         }
 
 
 def prepare_annotations(item, start_frame, end_frame, fps):
-    truth_bdb_time = item["beat_time"]
-    truth_bdb_value = item["beat_value"]
-    # convert beat time from seconds to frame
-    truth_bdb_frame = (truth_bdb_time * fps).round().astype(int)
-    # form annotations excerpt
-    # filter out the annotations that are earlier than the start and shift left
-    truth_bdb_frame -= start_frame
-    idx = np.searchsorted(truth_bdb_frame, 0)
-    truth_bdb_frame = truth_bdb_frame[idx:]
-    truth_bdb_value = truth_bdb_value[idx:]
-    # filter out the annotations that are later than the end
-    idx = np.searchsorted(truth_bdb_frame, end_frame - start_frame)
-    truth_bdb_frame = truth_bdb_frame[:idx]
-    truth_bdb_value = truth_bdb_value[:idx]
-    # create beat and downbeat separated annotations
-    truth_beat = truth_bdb_frame
-    truth_downbeat = truth_bdb_frame[truth_bdb_value == 1]
-    # transform beat downbeat to frame-wise annotations
-    framewise_truth_beat = index_to_framewise(truth_beat, end_frame - start_frame)
-    framewise_truth_downbeat = index_to_framewise(
-        truth_downbeat, end_frame - start_frame
+    boundary_time = item["boundary_time"]
+    boundary_frame = (boundary_time * fps).round().astype(int)
+    boundary_frame -= start_frame
+    idx = np.searchsorted(boundary_frame, 0)
+    boundary_frame = boundary_frame[idx:]
+    idx = np.searchsorted(boundary_frame, end_frame - start_frame)
+    boundary_frame = boundary_frame[:idx]
+    framewise_truth_boundary = index_to_framewise(
+        boundary_frame, end_frame - start_frame
     )
-    # create orig beat, downbeat annotations for unquantized evaluation
-    truth_orig_beat = item["beat_time"]
-    truth_orig_downbeat = truth_bdb_time[
-        item["beat_value"] == 1
-    ]  # (use the full beat_value)
-    # filter out the annotations that are outside the excerpt, and shift them left to the excerpt time
-    truth_orig_beat = truth_orig_beat[
-        (truth_orig_beat >= start_frame / fps) & (truth_orig_beat < end_frame / fps)
+    truth_orig_boundary = boundary_time[
+        (boundary_time >= start_frame / fps) & (boundary_time < end_frame / fps)
     ] - (start_frame / fps)
-    truth_orig_downbeat = truth_orig_downbeat[
-        (truth_orig_downbeat >= start_frame / fps)
-        & (truth_orig_downbeat < end_frame / fps)
-    ] - (start_frame / fps)
-    # convert to strings (trick to collate sequences of different lengths)
-    truth_orig_beat = truth_orig_beat.tobytes()
-    truth_orig_downbeat = truth_orig_downbeat.tobytes()
-    return (
-        framewise_truth_beat,
-        framewise_truth_downbeat,
-        truth_orig_beat,
-        truth_orig_downbeat,
-    )
+    truth_orig_boundary = truth_orig_boundary.tobytes()
+    return framewise_truth_boundary, truth_orig_boundary
+
+
+def collate_phrase_batches(batch):
+    """Pad variable-length phrase excerpts so PyTorch can stack them."""
+
+    max_len = max(item["spect"].shape[0] for item in batch)
+    max_mel = max(item["spect"].shape[1] for item in batch)
+
+    spect = torch.zeros((len(batch), max_len, max_mel), dtype=torch.float32)
+    truth_boundary = torch.zeros((len(batch), max_len), dtype=torch.float32)
+    padding_mask = torch.zeros((len(batch), max_len), dtype=torch.bool)
+
+    collated = {
+        "spect": spect,
+        "truth_boundary": truth_boundary,
+        "padding_mask": padding_mask,
+        "dataset": [],
+        "spect_path": [],
+        "start_frame": [],
+        "truth_orig_boundary": [],
+    }
+
+    for idx, item in enumerate(batch):
+        length = item["spect"].shape[0]
+        mel_dim = item["spect"].shape[1]
+        collated["spect"][idx, :length, :mel_dim] = torch.as_tensor(
+            item["spect"], dtype=torch.float32
+        )
+        collated["truth_boundary"][idx, :length] = torch.as_tensor(
+            item["truth_boundary"], dtype=torch.float32
+        )
+        collated["padding_mask"][idx, :length] = torch.as_tensor(
+            item["padding_mask"], dtype=torch.bool
+        )
+        collated["dataset"].append(item["dataset"])
+        collated["spect_path"].append(item["spect_path"])
+        collated["start_frame"].append(item["start_frame"])
+        collated["truth_orig_boundary"].append(item["truth_orig_boundary"])
+
+    return collated
