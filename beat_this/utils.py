@@ -23,11 +23,14 @@ def filename_to_augmentation(filename):
     return augmentations
 
 
+# Legacy beat tracking functions - kept for backward compatibility
+# but not used in phrase boundary detection
 def infer_beat_numbers(beats: np.ndarray, downbeats: np.ndarray) -> np.ndarray:
     """
-    From beat and downbeat times, infer a number for each beat such that each downbeat
+    LEGACY: From beat and downbeat times, infer a number for each beat such that each downbeat
     is associated with a 1 and beats in between are counted upwards.
     The function requires that all downbeats are also listed as beats.
+    This function is not used in phrase boundary detection.
 
     Args:
         beats (numpy.ndarray): Array of beat positions in seconds (including downbeats).
@@ -78,9 +81,10 @@ def infer_beat_numbers(beats: np.ndarray, downbeats: np.ndarray) -> np.ndarray:
 
 def save_beat_tsv(beats: np.ndarray, downbeats: np.ndarray, outpath: str) -> None:
     """
-    Save beat information to a tab-separated file in the standard .beats format:
+    LEGACY: Save beat information to a tab-separated file in the standard .beats format:
     each line has a time in seconds, a tab, and a beat number (1 = downbeat).
     The function requires that all downbeats are also listed as beats.
+    This function is not used in phrase boundary detection.
 
     Args:
         beats (numpy.ndarray): Array of beat positions in seconds (including downbeats).
@@ -98,6 +102,27 @@ def save_beat_tsv(beats: np.ndarray, downbeats: np.ndarray, outpath: str) -> Non
     try:
         with open(outpath, "w") as f:
             f.writelines(f"{beat}\t{number}\n" for beat, number in zip(beats, numbers))
+    except KeyboardInterrupt:
+        outpath.unlink()  # avoid half-written files
+
+
+def save_boundary_tsv(boundaries: np.ndarray, outpath: str) -> None:
+    """
+    Save phrase boundary information to a file.
+    Each line has a time in seconds representing a phrase boundary.
+
+    Args:
+        boundaries (numpy.ndarray): Array of phrase boundary positions in seconds.
+        outpath (str): Path to the output TSV file.
+
+    Returns:
+        None
+    """
+    # write the boundary file
+    Path(outpath).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(outpath, "w") as f:
+            f.writelines(f"{boundary}\n" for boundary in boundaries)
     except KeyboardInterrupt:
         outpath.unlink()  # avoid half-written files
 

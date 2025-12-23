@@ -15,12 +15,12 @@ except ImportError:
     tqdm = None
 
 from beat_this.inference import File2File, load_audio
-from beat_this.utils import save_beat_tsv
+from beat_this.utils import save_boundary_tsv
 
 
 def get_parser():
     parser = argparse.ArgumentParser(
-        description="Detects beats in given audio files with a Beat This! model."
+        description="Detects phrase boundaries in given audio files."
     )
     parser.add_argument(
         "inputs",
@@ -45,7 +45,7 @@ def get_parser():
         "--suffix",
         "-s",
         type=str,
-        default=".beats",
+        default=".boundaries",
         help="Suffix for output file names (default: %(default)s). Also see --append. Ignored if an explicit output file name is given.",
     )
     parser.add_argument(
@@ -67,7 +67,7 @@ def get_parser():
         "--dbn",
         default=False,
         action=argparse.BooleanOptionalAction,
-        help="Override the option to use madmom's postprocessing DBN.",
+        help="Not applicable for phrase boundaries. Kept for compatibility.",
     )
     parser.add_argument(
         "--gpu",
@@ -136,13 +136,13 @@ def run(
         def process(audiofile, outfile):
             wav, sr = load_audio(audiofile)
             spect = file2file.signal2spect(wav, sr)
-            beat_logits, downbeat_logits = file2file.spect2frames(spect)
+            boundary_logits = file2file.spect2frames(spect)
             np.save(
                 outfile.with_suffix(".npy"),
-                np.vstack([beat_logits.cpu().numpy(), downbeat_logits.cpu().numpy()]),
+                boundary_logits.cpu().numpy(),
             )
-            beats, downbeats = file2file.frames2beats(beat_logits, downbeat_logits)
-            save_beat_tsv(beats, downbeats, outfile)
+            boundaries = file2file.frames2boundaries(boundary_logits)
+            save_boundary_tsv(boundaries, outfile)
 
     else:
         process = file2file

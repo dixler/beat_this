@@ -16,10 +16,10 @@ from beat_this.utils import replace_state_dict_key
 
 class BeatThis(nn.Module):
     """
-    A neural network model for beat tracking. It is composed of three main components:
+    A neural network model for phrase boundary detection. It is composed of three main components:
     - a frontend that processes the input spectrogram,
     - a series of transformer blocks that process the output of the frontend,
-    - a head that produces the final beat and downbeat predictions.
+    - a head that produces the final phrase boundary predictions.
 
     Args:
         spect_dim (int): The dimension of the input spectrogram (default: 128).
@@ -302,37 +302,29 @@ class PartialFTTransformer(nn.Module):
 
 class SumHead(nn.Module):
     """
-    A PyTorch module that produces the final beat and downbeat prediction logits.
-    The beats are a sum of all beats and all downbeats predictions, to reduce the prediction
-    of downbeats which are not beats.
+    A PyTorch module that produces the final phrase boundary prediction logits.
     """
 
     def __init__(self, input_dim):
         super().__init__()
-        self.beat_downbeat_lin = nn.Linear(input_dim, 2)
+        self.boundary_lin = nn.Linear(input_dim, 1)
 
     def forward(self, x):
-        beat_downbeat = self.beat_downbeat_lin(x)
-        # separate beat from downbeat
-        beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
-        # aggregate beats and downbeats prediction
-        # autocast to float16 disabled to avoid numerical issues causing NaNs
-        with torch.autocast(beat.device.type, enabled=False):
-            beat = beat.float() + downbeat.float()
-        return {"beat": beat, "downbeat": downbeat}
+        boundary = self.boundary_lin(x)
+        boundary = rearrange(boundary, "b t 1 -> b t")
+        return {"boundary": boundary}
 
 
 class Head(nn.Module):
     """
-    A PyToch module that produces the final beat and downbeat prediction logits with independent linear layers outputs.
+    A PyTorch module that produces the final phrase boundary prediction logits.
     """
 
     def __init__(self, input_dim):
         super().__init__()
-        self.beat_downbeat_lin = nn.Linear(input_dim, 2)
+        self.boundary_lin = nn.Linear(input_dim, 1)
 
     def forward(self, x):
-        beat_downbeat = self.beat_downbeat_lin(x)
-        # separate beat from downbeat
-        beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
-        return {"beat": beat, "downbeat": downbeat}
+        boundary = self.boundary_lin(x)
+        boundary = rearrange(boundary, "b t 1 -> b t")
+        return {"boundary": boundary}
